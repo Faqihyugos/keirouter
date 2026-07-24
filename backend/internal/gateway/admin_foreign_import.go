@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,11 @@ import (
 	"github.com/mydisha/keirouter/backend/internal/store"
 	"github.com/mydisha/keirouter/backend/internal/vault"
 )
+
+// foreignImportMaxBytes caps 9router/OmniRoute backup JSON uploads.
+// Larger than chat maxBodyBytes because full router exports can include
+// many accounts, combos, and provider nodes in one document.
+const foreignImportMaxBytes = 64 << 20 // 64 MiB
 
 // Foreign config import: convert a 9router (or OmniRoute) backup JSON into
 // KeiRouter's native data model. Credentials are re-sealed under the local
@@ -51,8 +57,14 @@ type foreignImportResult struct {
 func (s *Server) adminImportForeignConfig(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
-	bodyBytes, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<20))
+	bodyBytes, err := io.ReadAll(http.MaxBytesReader(w, r.Body, foreignImportMaxBytes))
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("import body too large: max %d MiB", foreignImportMaxBytes>>20))
+			return
+		}
 		writeError(w, http.StatusBadRequest, "read body: "+err.Error())
 		return
 	}

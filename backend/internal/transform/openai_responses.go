@@ -318,8 +318,17 @@ func rawToString(raw json.RawMessage) string {
 // ---- request rendering (outbound to Codex/Responses provider) ---------------
 
 func (OpenAIResponsesCodec) RenderRequest(req *core.ChatRequest) ([]byte, error) {
+	// Catalog aliases like grok-4.5-high / gpt-5.3-codex-high are not real
+	// upstream model IDs. Strip the effort suffix and emit reasoning.effort
+	// instead. Explicit req.Reasoning.Effort wins over the suffix value.
+	model, suffixEffort := splitResponsesEffortModel(req.Model)
+	effort := suffixEffort
+	if req.Reasoning != nil && strings.TrimSpace(req.Reasoning.Effort) != "" {
+		effort = strings.TrimSpace(req.Reasoning.Effort)
+	}
+
 	out := map[string]any{
-		"model":  req.Model,
+		"model":  model,
 		"stream": req.Stream,
 		"store":  false,
 	}
@@ -327,6 +336,9 @@ func (OpenAIResponsesCodec) RenderRequest(req *core.ChatRequest) ([]byte, error)
 		out["instructions"] = req.System
 	} else {
 		out["instructions"] = ""
+	}
+	if isResponsesReasoningEffortEnabled(effort) {
+		out["reasoning"] = map[string]any{"effort": effort}
 	}
 	// NOTE: temperature, max_tokens, top_p are intentionally NOT included.
 	// These are Chat Completions parameters that the Responses API does not
@@ -454,6 +466,27 @@ func (OpenAIResponsesCodec) RenderRequest(req *core.ChatRequest) ([]byte, error)
 	}
 
 	return json.Marshal(out)
+}
+
+// splitResponsesEffortModel peels a trailing effort suffix off a synthetic
+// catalog model id (e.g. "grok-4.5-high" → "grok-4.5", "high"). Longest
+// suffixes are checked first so "-xhigh" wins over "-high".
+func splitResponsesEffortModel(model string) (base, effort string) {
+	for _, suf := range []string{"-xhigh", "-high", "-medium", "-low", "-none"} {
+		if strings.HasSuffix(model, suf) && len(model) > len(suf) {
+			return strings.TrimSuffix(model, suf), strings.TrimPrefix(suf, "-")
+		}
+	}
+	return model, ""
+}
+
+func isResponsesReasoningEffortEnabled(effort string) bool {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "", "none", "off", "disable", "disabled":
+		return false
+	default:
+		return true
+	}
 }
 
 // ---- unary response parsing (from Codex/Responses provider) -----------------
