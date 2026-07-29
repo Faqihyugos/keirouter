@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/mydisha/keirouter/backend/internal/core"
 )
@@ -306,5 +307,196 @@ func TestUnwrapQoderSSELineWithError_SurfacesEnvelopeError(t *testing.T) {
 	}
 	if pe.Message != "Invalid tool parameters" {
 		t.Fatalf("message = %q, want Invalid tool parameters", pe.Message)
+	}
+}
+
+func TestQoderIsPAT_DetectsAuthMethodAndPrefix(t *testing.T) {
+	cases := []struct {
+		name  string
+		creds core.Credentials
+		want  bool
+	}{
+		{
+			name:  "marked pat",
+			creds: core.Credentials{APIKey: "pt-abc", Extra: map[string]string{"qoder_auth_method": "pat"}},
+			want:  true,
+		},
+		{
+			name:  "pt prefix without marker",
+			creds: core.Credentials{APIKey: "pt-abc"},
+			want:  true,
+		},
+		{
+			name:  "oauth access token",
+			creds: core.Credentials{AccessToken: "dt-xyz", Extra: map[string]string{"user_id": "u1"}},
+			want:  false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := qoderIsPAT(tc.creds); got != tc.want {
+				t.Fatalf("qoderIsPAT = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestQoderPATToken_PrefersAPIKey(t *testing.T) {
+	if got := qoderPATToken(core.Credentials{APIKey: "pt-key", AccessToken: "pt-token"}); got != "pt-key" {
+		t.Fatalf("qoderPATToken = %q, want pt-key", got)
+	}
+	if got := qoderPATToken(core.Credentials{AccessToken: "pt-token"}); got != "pt-token" {
+		t.Fatalf("qoderPATToken fallback = %q, want pt-token", got)
+	}
+}
+
+func TestQoderValidateCreds_PATRequiresToken(t *testing.T) {
+	connector := NewQoder("qoder", "")
+
+	// A PAT-marked credential with no token must be rejected as an auth error.
+	err := connector.validateCreds(core.Credentials{Extra: map[string]string{"qoder_auth_method": "pat"}})
+	var pe *core.ProviderError
+	if !errors.As(err, &pe) || pe.Kind != core.ErrAuth {
+		t.Fatalf("expected auth ProviderError, got %v", err)
+	}
+
+	// A PAT-marked credential with a token passes without OAuth fields.
+	if err := connector.validateCreds(core.Credentials{APIKey: "pt-abc", Extra: map[string]string{"qoder_auth_method": "pat"}}); err != nil {
+		t.Fatalf("validateCreds(pat) = %v, want nil", err)
+	}
+}
+
+func TestParseQoderJobToken(t *testing.T) {
+	cases := []struct {
+		name      string
+		body      string
+		wantToken string
+		wantTTL   time.Duration
+	}{
+		{
+			// expires_in is milliseconds; the ~24h lifetime is kept minus skew.
+			name:      "root token with expires_in millis",
+			body:      `{"token":"jt-root","expires_in":86400000}`,
+			wantToken: "jt-root",
+			wantTTL:   24*time.Hour - qoderJobTokenRefreshSkew,
+		},
+		{
+			name:      "nested data jobToken defaults ttl",
+			body:      `{"data":{"jobToken":"jt-nested"}}`,
+			wantToken: "jt-nested",
+			wantTTL:   qoderJobTokenDefaultTTL,
+		},
+		{
+			name:      "non jt token ignored",
+			body:      `{"token":"pt-not-a-job-token"}`,
+			wantToken: "",
+			wantTTL:   0,
+		},
+		{
+			// A sub-skew lifetime is clamped up to the minimum.
+			name:      "tiny expiry clamped to min",
+			body:      `{"jt":"jt-small","expires_in":1}`,
+			wantToken: "jt-small",
+			wantTTL:   qoderJobTokenMinTTL,
+		},
+		{
+			name:      "invalid json",
+			body:      `not-json`,
+			wantToken: "",
+			wantTTL:   0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			token, ttl := parseQoderJobToken([]byte(tc.body))
+			if token != tc.wantToken {
+				t.Fatalf("token = %q, want %q", token, tc.wantToken)
+			}
+			if ttl != tc.wantTTL {
+				t.Fatalf("ttl = %v, want %v", ttl, tc.wantTTL)
+			}
+		})
+	}
+}
+
+func TestParseQoderJobToken_ExpiresAtTimestamp(t *testing.T) {
+	// The RFC3339 expires_at takes precedence over expires_in. The captured
+	// real response reports both; the absolute timestamp should win.
+	expiresAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	body := `{"token":"jt-abc","expires_at":"` + expiresAt + `","expires_in":86400000}`
+	token, ttl := parseQoderJobToken([]byte(body))
+	if token != "jt-abc" {
+		t.Fatalf("token = %q, want jt-abc", token)
+	}
+	// ~24h minus the refresh skew, allowing a small window for test runtime.
+	want := 24*time.Hour - qoderJobTokenRefreshSkew
+	if ttl > want || ttl < want-time.Minute {
+		t.Fatalf("ttl = %v, want ~%v", ttl, want)
+	}
+}
+
+func TestQoderQuotaFromStatus(t *testing.T) {
+	reset := int64(1786374621453)
+	wantReset := time.UnixMilli(reset).UTC().Format(time.RFC3339)
+
+	// Pro Trial with quota:0 and not exceeded — the captured real account. It
+	// must report the plan (from userTag) with no misleading usage bar.
+	trial := qoderQuotaFromStatus(&qoderUserStatus{
+		UserType: "personal_professional_trial", Quota: 0, IsQuotaExceeded: false,
+		Plan: "PLAN_TIER_PRO_TRIAL", UserTag: "Pro Trial", NextResetAt: reset,
+	})
+	if trial.PlanName != "Pro Trial" {
+		t.Fatalf("trial plan = %q, want Pro Trial", trial.PlanName)
+	}
+	if len(trial.Quotas) != 0 {
+		t.Fatalf("trial quotas = %d, want 0 (pooled/plan-only)", len(trial.Quotas))
+	}
+	if trial.Message == "" {
+		t.Fatalf("trial message empty, want a plan message")
+	}
+
+	// A finite per-user quota renders a full-remaining bar with an RFC3339 reset.
+	metered := qoderQuotaFromStatus(&qoderUserStatus{
+		UserType: "personal", Quota: 500, IsQuotaExceeded: false,
+		Plan: "PLAN_TIER_PRO", NextResetAt: reset,
+	})
+	if metered.PlanName != "Pro" {
+		t.Fatalf("metered plan = %q, want Pro (prettified from PLAN_TIER_PRO)", metered.PlanName)
+	}
+	if len(metered.Quotas) != 1 {
+		t.Fatalf("metered quotas = %d, want 1", len(metered.Quotas))
+	}
+	if q := metered.Quotas[0]; q.Limit != 500 || q.Remaining != 500 || q.ResetAt != wantReset {
+		t.Fatalf("metered quota = %+v, want limit 500 remaining 500 reset %s", q, wantReset)
+	}
+
+	// Exhausted quota reports a 0-remaining bar so routing can skip the account.
+	exceeded := qoderQuotaFromStatus(&qoderUserStatus{
+		UserType: "personal", Quota: 100, IsQuotaExceeded: true, UserTag: "Pro", NextResetAt: reset,
+	})
+	if len(exceeded.Quotas) != 1 || exceeded.Quotas[0].Remaining != 0 {
+		t.Fatalf("exceeded quota = %+v, want a single 0-remaining entry", exceeded.Quotas)
+	}
+
+	// Team seats draw from a pooled org quota; quota:0 there means pooled.
+	team := qoderQuotaFromStatus(&qoderUserStatus{
+		UserType: "teams", Quota: 0, IsQuotaExceeded: false, UserTag: "Team",
+	})
+	if len(team.Quotas) != 0 || team.Message == "" {
+		t.Fatalf("team quota = %+v msg=%q, want plan-only pooled", team.Quotas, team.Message)
+	}
+}
+
+func TestPrettifyQoderPlan(t *testing.T) {
+	cases := []struct{ plan, tag, want string }{
+		{"PLAN_TIER_PRO_TRIAL", "Pro Trial", "Pro Trial"}, // userTag preferred
+		{"PLAN_TIER_PRO_TRIAL", "", "Pro Trial"},          // prettified enum
+		{"PLAN_TIER_ENTERPRISE", "", "Enterprise"},
+		{"", "", "Qoder"}, // fallback
+	}
+	for _, tc := range cases {
+		if got := prettifyQoderPlan(tc.plan, tc.tag); got != tc.want {
+			t.Errorf("prettifyQoderPlan(%q, %q) = %q, want %q", tc.plan, tc.tag, got, tc.want)
+		}
 	}
 }

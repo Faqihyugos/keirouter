@@ -21,6 +21,18 @@ const (
 
 	// ModelListURL returns the live model catalog (COSY-signed GET).
 	ModelListURL = "https://api3.qoder.sh/algo/api/v2/model/list"
+
+	// JobTokenExchangeURL exchanges a Personal Access Token (pt-*) for a
+	// short-lived job token (jt-*). A raw PAT cannot be used as the COSY
+	// security_oauth_token; qodercli performs this exchange first and carries
+	// the resulting jt-* in the Cosy envelope for every signed request.
+	JobTokenExchangeURL = "https://openapi.qoder.sh/api/v1/jobToken/exchange"
+
+	// UserStatusURL returns the token owner's account profile (id, email,
+	// name) and plan/quota. It authenticates with a plain Bearer job token
+	// (no COSY). The COSY envelope's uid MUST be the owner's real user id
+	// from this endpoint — a synthetic uid is rejected with "Login expired".
+	UserStatusURL = "https://openapi.qoder.sh/api/v3/user/status"
 )
 
 // COSY header fingerprint constants. These are not arbitrary — the upstream

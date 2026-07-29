@@ -3136,6 +3136,12 @@ func providerAccountMetadata(spec connectors.ProviderSpec, in providerMetadataIn
 		}
 		// OpenAICompatible resolves {accountId} placeholders from Extra.
 		meta["accountId"] = accountID
+	case "qoder":
+		// API-key connections to Qoder use a Personal Access Token (pt-*),
+		// which the connector exchanges for a short-lived COSY job token. Mark
+		// the auth method and mint a stable machine id for the COSY envelope.
+		meta["qoder_auth_method"] = "pat"
+		meta["machine_id"] = uuid.NewString()
 	case "azure":
 		endpoint := strings.TrimRight(strings.TrimSpace(in.AzureEndpoint), "/")
 		deployment := strings.TrimSpace(in.AzureDeployment)
