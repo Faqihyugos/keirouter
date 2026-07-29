@@ -451,8 +451,8 @@ func TestQoderQuotaFromStatus(t *testing.T) {
 	if len(trial.Quotas) != 0 {
 		t.Fatalf("trial quotas = %d, want 0 (pooled/plan-only)", len(trial.Quotas))
 	}
-	if trial.Message == "" {
-		t.Fatalf("trial message empty, want a plan message")
+	if trial.Message != "Pro Trial plan · usage not metered by Qoder" {
+		t.Fatalf("trial message = %q, want the not-metered note", trial.Message)
 	}
 
 	// A finite per-user quota renders a full-remaining bar with an RFC3339 reset.
@@ -482,8 +482,8 @@ func TestQoderQuotaFromStatus(t *testing.T) {
 	team := qoderQuotaFromStatus(&qoderUserStatus{
 		UserType: "teams", Quota: 0, IsQuotaExceeded: false, UserTag: "Team",
 	})
-	if len(team.Quotas) != 0 || team.Message == "" {
-		t.Fatalf("team quota = %+v msg=%q, want plan-only pooled", team.Quotas, team.Message)
+	if len(team.Quotas) != 0 || team.Message != "Team plan · shared team pool" {
+		t.Fatalf("team quota = %+v msg=%q, want plan-only shared team pool", team.Quotas, team.Message)
 	}
 }
 

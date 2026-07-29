@@ -285,8 +285,9 @@ func (c *Qoder) FetchQuota(ctx context.Context, creds core.Credentials) (*QuotaR
 
 // qoderQuotaFromStatus maps a user/status payload into a QuotaResult. Mirrors
 // OmniRoute's parseQoderUserStatusUsage: exhausted quota reports a 0-remaining
-// bar; pooled team/enterprise seats or accounts with no per-user counter report
-// the plan only (a limit:0 bar would render as 0%/exhausted in the UI).
+// bar; pooled team/enterprise seats report a shared-pool note; accounts with no
+// per-user counter (trials) report a not-metered note (a limit:0 bar would
+// render as 0%/exhausted in the UI).
 func qoderQuotaFromStatus(st *qoderUserStatus) *QuotaResult {
 	plan := prettifyQoderPlan(st.Plan, st.UserTag)
 	resetAt := qoderResetAt(st.NextResetAt)
@@ -306,8 +307,13 @@ func qoderQuotaFromStatus(st *qoderUserStatus) *QuotaResult {
 			PlanName:     plan,
 		})
 		result.Message = "Quota exceeded."
-	case pooled || quota <= 0:
-		result.Message = plan + " plan · pooled quota"
+	case pooled:
+		result.Message = plan + " plan · shared team pool"
+	case quota <= 0:
+		// Trial / individual plans that Qoder does not meter with a per-user
+		// counter report quota:0 while isQuotaExceeded stays false. There is no
+		// remaining-credit number to show, so name the plan and say so plainly.
+		result.Message = plan + " plan · usage not metered by Qoder"
 	default:
 		result.Quotas = append(result.Quotas, QuotaEntry{
 			ResourceType: "requests",
