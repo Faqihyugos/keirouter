@@ -169,6 +169,11 @@ export interface OAuthPollResult {
   provider?: string;
 }
 
+export interface OAuthCallbackStatus {
+  status: "pending" | "success" | "error" | "expired" | string;
+  message?: string;
+}
+
 export interface Plan {
   id: string;
   name: string;
@@ -1426,6 +1431,11 @@ export const api = {
     }),
   oauthExchange: (provider: string, input: { code: string; state: string; label?: string }) =>
     request<{ id: string; provider: string; email: string }>("POST", `/oauth/${provider}/exchange`, input),
+  // Polls whether a redirect-based flow completed server-side. Needed for
+  // providers whose auth pages sever window.opener (COOP), where the popup's
+  // postMessage never reaches the dashboard.
+  oauthCallbackStatus: (provider: string, state: string) =>
+    request<OAuthCallbackStatus>("GET", `/oauth/${provider}/callback-status?state=${encodeURIComponent(state)}`),
   oauthDeviceCode: (provider: string) =>
     request<DeviceCode>("POST", `/oauth/${provider}/device-code`, {}),
   oauthDeviceCodeSubmit: (

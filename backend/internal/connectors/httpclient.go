@@ -636,19 +636,42 @@ func shouldRetryFreshConnection(ctx context.Context, err error) bool {
 func httpStatusError(provider, model string, resp *http.Response, body []byte) error {
 	kind := core.ErrUpstream
 	var retryAfter time.Duration
+	var creditsExhausted bool
 	switch {
 	case resp.StatusCode == http.StatusTooManyRequests:
-		// Classify 429 into transient rate-limit vs hard quota exhaustion.
-		// Quota exhaustion gets a much longer cooldown than per-minute throttling.
-		kind, retryAfter = classify429(resp, body)
+		// Classify 429 into transient rate-limit vs hard quota exhaustion vs
+		// depleted paid balance. Quota exhaustion gets a much longer cooldown
+		// than per-minute throttling; a dry balance parks the account.
+		kind, retryAfter, creditsExhausted = classify429(resp, body)
 	case resp.StatusCode == http.StatusUnauthorized, resp.StatusCode == http.StatusForbidden:
 		kind = core.ErrAuth
+		// Some gateways report a depleted balance as 403 rather than 402.
+		if looksLikeCreditsExhausted(string(body)) {
+			kind = core.ErrQuotaExhausted
+			creditsExhausted = true
+		}
 	case resp.StatusCode == http.StatusPaymentRequired:
 		kind = core.ErrQuotaExhausted
+		creditsExhausted = true
 	case resp.StatusCode == http.StatusNotFound:
 		kind = core.ErrModelUnavailable
 	case resp.StatusCode >= 400 && resp.StatusCode < 500:
 		kind = core.ErrBadRequest
+		// Some backends report unknown or inaccessible models as a plain 400
+		// (Codex: "The 'X' model is not supported when using Codex with a
+		// ChatGPT account"). Classify those as model-unavailable so chains
+		// fall back to the next model/provider instead of hard-failing the
+		// request.
+		if isModelUnsupportedBody(body) {
+			kind = core.ErrModelUnavailable
+		}
+		// Anthropic-style APIs return "credit balance is too low" as a plain
+		// 400 invalid_request_error. Treat it as a depleted balance so chains
+		// fall back to the next account instead of surfacing a request error.
+		if kind == core.ErrBadRequest && looksLikeCreditsExhausted(string(body)) {
+			kind = core.ErrQuotaExhausted
+			creditsExhausted = true
+		}
 	}
 
 	scope := core.FailureScopeProvider
@@ -662,13 +685,14 @@ func httpStatusError(provider, model string, resp *http.Response, body []byte) e
 	}
 
 	pe := &core.ProviderError{
-		Kind:       kind,
-		Scope:      scope,
-		Provider:   provider,
-		Model:      model,
-		StatusCode: resp.StatusCode,
-		Message:    truncateError(body),
-		RetryAfter: retryAfter,
+		Kind:             kind,
+		Scope:            scope,
+		Provider:         provider,
+		Model:            model,
+		StatusCode:       resp.StatusCode,
+		Message:          truncateError(body),
+		RetryAfter:       retryAfter,
+		CreditsExhausted: creditsExhausted,
 	}
 	// Preserve the existing Retry-After header parsing for non-429 errors.
 	if pe.RetryAfter <= 0 {
@@ -683,6 +707,34 @@ func httpStatusError(provider, model string, resp *http.Response, body []byte) e
 		}
 	}
 	return pe
+}
+
+// modelUnsupportedPhrases are error-body fragments that reliably indicate the
+// requested model cannot be served by this provider/account (unknown id, no
+// access) rather than a malformed request. Matched case-insensitively and only
+// on bodies that mention "model" to avoid misclassifying generic errors.
+var modelUnsupportedPhrases = []string{
+	"model is not supported", "model not supported",
+	"model is not available", "model not available",
+	"model not found", "model_not_found", "deployment_not_found",
+	"invalid model", "unknown model",
+	"model does not exist", "does not exist or you do not have access",
+	"access to model", "access to the model",
+}
+
+// isModelUnsupportedBody reports whether a 4xx body describes a model the
+// provider/account cannot serve.
+func isModelUnsupportedBody(body []byte) bool {
+	s := strings.ToLower(string(body))
+	if !strings.Contains(s, "model") {
+		return false
+	}
+	for _, p := range modelUnsupportedPhrases {
+		if strings.Contains(s, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // checkNonJSONResponse detects a successful (non-error) HTTP response whose

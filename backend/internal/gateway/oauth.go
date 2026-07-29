@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -31,6 +32,7 @@ func (s *Server) mountOAuth(r chi.Router) {
 	r.Post("/oauth/{provider}/device-code", s.oauthDeviceCode)
 	r.Post("/oauth/{provider}/device-code-submit", s.oauthDeviceCodeSubmit)
 	r.Post("/oauth/{provider}/poll", s.oauthPoll)
+	r.Get("/oauth/{provider}/callback-status", s.oauthCallbackStatus)
 }
 
 // oauthListProviders reports which catalog providers support an OAuth flow.
@@ -171,6 +173,72 @@ func (s *Server) oauthExchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"id": id, "provider": provider, "email": tokens.Email})
+}
+
+// oauthResultTTL bounds how long a finished callback result is retained for
+// the dashboard's completion polling.
+const oauthResultTTL = 10 * time.Minute
+
+type oauthResultEntry struct {
+	Provider string
+	Status   string // success | error
+	Message  string
+	At       time.Time
+}
+
+// oauthResults records the outcome of browser-redirect callbacks keyed by the
+// flow state, so the dashboard can poll for completion. postMessage from the
+// popup alone is unreliable: auth pages that set Cross-Origin-Opener-Policy
+// (OpenAI's Codex login does) sever window.opener during the redirect, so the
+// opener never hears from the popup and the user was forced into manually
+// pasting the callback URL.
+var oauthResults = struct {
+	sync.Mutex
+	m map[string]oauthResultEntry
+}{m: map[string]oauthResultEntry{}}
+
+// recordOAuthResult stores the terminal outcome of a callback for polling.
+func recordOAuthResult(state, provider string, err error) {
+	oauthResults.Lock()
+	defer oauthResults.Unlock()
+	for k, v := range oauthResults.m {
+		if time.Since(v.At) > oauthResultTTL {
+			delete(oauthResults.m, k)
+		}
+	}
+	entry := oauthResultEntry{Provider: provider, Status: "success", At: time.Now()}
+	if err != nil {
+		entry.Status = "error"
+		entry.Message = err.Error()
+	}
+	oauthResults.m[state] = entry
+}
+
+// oauthCallbackStatus lets the dashboard poll whether a redirect-based flow
+// completed server-side (the loopback/gateway callback already exchanged the
+// code and persisted the account). Responses: pending | success | error |
+// expired.
+func (s *Server) oauthCallbackStatus(w http.ResponseWriter, r *http.Request) {
+	provider := chi.URLParam(r, "provider")
+	state := r.URL.Query().Get("state")
+	if state == "" {
+		writeError(w, http.StatusBadRequest, "state is required")
+		return
+	}
+
+	oauthResults.Lock()
+	res, ok := oauthResults.m[state]
+	oauthResults.Unlock()
+	if ok && res.Provider == provider {
+		writeJSON(w, http.StatusOK, map[string]any{"status": res.Status, "message": res.Message})
+		return
+	}
+
+	if sess, ok := s.oauthSessions.Get(state); ok && sess.Provider == provider {
+		writeJSON(w, http.StatusOK, map[string]any{"status": "pending"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "expired"})
 }
 
 // oauthCallback handles the GET redirect from OAuth providers after the user

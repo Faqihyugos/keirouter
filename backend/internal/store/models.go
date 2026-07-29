@@ -92,6 +92,10 @@ type Account struct {
 	CooldownUntil  *time.Time
 	ProxyPoolID    string // bound proxy pool id (empty = no proxy)
 	NeedsReconnect bool   // true when the OAuth refresh token was permanently rejected (re-auth required)
+	// CreditsExhausted is true when the provider reported a depleted paid
+	// balance. The dispatcher parks the account; the flag clears on a
+	// successful request, a provider reconnect, or a manual reset.
+	CreditsExhausted bool
 
 	CreatedAt time.Time
 	UpdatedAt time.Time

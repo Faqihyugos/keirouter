@@ -27,7 +27,13 @@ type OpenAIResponses struct {
 
 // NewOpenAIResponses builds a Responses connector.
 func NewOpenAIResponses(id, defaultBaseURL string) *OpenAIResponses {
-	return &OpenAIResponses{id: id, defaultBase: defaultBaseURL}
+	return &OpenAIResponses{
+		id:          id,
+		defaultBase: defaultBaseURL,
+		// The ChatGPT Codex backend needs a tailored request shape (reasoning
+		// summary, encrypted-content include, default instructions).
+		codec: transform.OpenAIResponsesCodec{Codex: id == "codex"},
+	}
 }
 
 func (c *OpenAIResponses) ID() string            { return c.id }
@@ -70,9 +76,10 @@ func (c *OpenAIResponses) Validate(ctx context.Context, creds core.Credentials) 
 	base = strings.TrimSuffix(base, "/responses")
 	modelsURL := base + "/models"
 	// Codex's ChatGPT backend rejects the models probe without a client_version
-	// query param (mirrors the codex CLI).
+	// query param (mirrors the codex CLI). Stale versions silently omit newer
+	// models from the listing, so reuse the CLI version we impersonate.
 	if c.id == "codex" {
-		modelsURL += "?client_version=1.0.0"
+		modelsURL += "?client_version=" + codexClientVersion
 	}
 	if _, err := doJSONMethod(ctx, http.MethodGet, c.id, "validate", modelsURL, nil, c.headers(creds)); err != nil {
 		return fmt.Errorf("validation failed for %s: %w", c.id, err)
@@ -88,12 +95,20 @@ func (c *OpenAIResponses) headers(creds core.Credentials) map[string]string {
 	case creds.APIKey != "":
 		h["Authorization"] = bearer(creds.APIKey)
 	}
+	// Codex requires the CLI identity headers (chatgpt-account-id, originator,
+	// ...) on inference calls; a bare Authorization header is not enough.
+	if c.id == "codex" {
+		applyCodexHeaders(h, creds)
+	}
 	return mergeHeaders(h, creds.Headers)
 }
 
 // Chat performs a non-streaming Responses call.
 func (c *OpenAIResponses) Chat(ctx context.Context, req *core.ChatRequest, creds core.Credentials) (*core.ChatResponse, error) {
 	req.Stream = false
+	if c.id == "codex" {
+		req = prepareCodexRequest(req)
+	}
 	body, err := c.codec.RenderRequest(req)
 	if err != nil {
 		return nil, &core.ProviderError{Kind: core.ErrInternal, Provider: c.id, Model: req.Model, Message: err.Error(), Cause: err}
@@ -115,6 +130,9 @@ func (c *OpenAIResponses) Chat(ctx context.Context, req *core.ChatRequest, creds
 // for zero-copy same-dialect piping.
 func (c *OpenAIResponses) StreamRaw(ctx context.Context, req *core.ChatRequest, creds core.Credentials, cfg core.StreamConfig) (io.ReadCloser, http.Header, error) {
 	req.Stream = true
+	if c.id == "codex" {
+		req = prepareCodexRequest(req)
+	}
 	body, err := c.codec.RenderRequest(req)
 	if err != nil {
 		return nil, nil, &core.ProviderError{Kind: core.ErrInternal, Provider: c.id, Model: req.Model, Message: err.Error(), Cause: err}
@@ -130,6 +148,9 @@ func (c *OpenAIResponses) StreamRaw(ctx context.Context, req *core.ChatRequest, 
 // Stream performs a streaming Responses call, reading the typed SSE event stream.
 func (c *OpenAIResponses) Stream(ctx context.Context, req *core.ChatRequest, creds core.Credentials, cfg core.StreamConfig) (<-chan core.StreamChunk, error) {
 	req.Stream = true
+	if c.id == "codex" {
+		req = prepareCodexRequest(req)
+	}
 	body, err := c.codec.RenderRequest(req)
 	if err != nil {
 		return nil, &core.ProviderError{Kind: core.ErrInternal, Provider: c.id, Model: req.Model, Message: err.Error(), Cause: err}

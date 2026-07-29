@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"sort"
 	"sync"
 	"time"
@@ -59,7 +60,24 @@ const (
 	ProviderCircuitMaxCooldown = 2 * time.Minute
 	// ProviderCircuitResetWindow forgets isolated failures after a quiet period.
 	ProviderCircuitResetWindow = time.Minute
+	// FailureDedupWindow collapses concurrent failures on one account into a
+	// single cooldown escalation. Without it, N in-flight requests failing on
+	// the same credential advance the backoff level N steps at once.
+	FailureDedupWindow = 5 * time.Second
+	// BackoffJitterFraction is the maximum random extension applied to locally
+	// computed cooldowns so accounts that failed together do not all become
+	// eligible again at the same instant.
+	BackoffJitterFraction = 0.25
+	// CreditsExhaustedCooldown parks an account whose paid balance is
+	// depleted. A dry balance only recovers when the user tops up or the plan
+	// renews, so probing every half hour just burns requests — one automatic
+	// retry per day plus manual reset via the dashboard covers recovery.
+	CreditsExhaustedCooldown = 24 * time.Hour
 )
+
+// maxRecentFailureEntries bounds the failure-dedup map; expired entries are
+// swept lazily once the map reaches this size.
+const maxRecentFailureEntries = 4096
 
 // Target is one candidate in a fallback chain.
 type Target struct {
@@ -147,6 +165,10 @@ type Dispatcher struct {
 	selectionLocks sync.Map
 	circuitMu      sync.Mutex
 	circuits       map[string]providerCircuit
+	// recentFailures tracks the last cooldown escalation per account (or
+	// account+model) so a burst of parallel failures counts once.
+	failureMu      sync.Mutex
+	recentFailures map[string]time.Time
 	// defaultCooldown is applied to an account when an error carries no
 	// upstream-specified Retry-After.
 	defaultCooldown time.Duration
@@ -166,6 +188,7 @@ func New(conns ConnectorSource, accounts *store.AccountRepo, v *vault.Vault) *Di
 		vault:           v,
 		defaultCooldown: 60 * time.Second,
 		circuits:        make(map[string]providerCircuit),
+		recentFailures:  make(map[string]time.Time),
 	}
 }
 
@@ -323,6 +346,11 @@ func (d *Dispatcher) PlanWith(ctx context.Context, tenantID string, targets []Ta
 	attempts := make([]Attempt, 0, len(ordered))
 	unhealthyAttempts := make([]Attempt, 0, len(ordered))
 	var lastReason string
+	// nonCooldownReason remembers accounts skipped for actionable reasons
+	// (needs-reconnect, token refresh failure). Without it, one account on
+	// cooldown makes the final error read as a pure rate limit and masks the
+	// real problem on the remaining accounts.
+	var nonCooldownReason string
 	var earliestRetryAt time.Time
 	blockedScope := core.FailureScopeAccount
 
@@ -400,6 +428,7 @@ func (d *Dispatcher) PlanWith(ctx context.Context, tenantID string, targets []Ta
 			// they need the user to re-authenticate before serving traffic.
 			if acc.NeedsReconnect {
 				lastReason = fmt.Sprintf("account %s needs reconnection (refresh token revoked)", acc.ID)
+				nonCooldownReason = lastReason
 				continue
 			}
 			// Model-level cooldown: skip this account only for this model.
@@ -433,6 +462,7 @@ func (d *Dispatcher) PlanWith(ctx context.Context, tenantID string, targets []Ta
 			}
 			if prepared.err != nil {
 				lastReason = prepared.err.Error()
+				nonCooldownReason = fmt.Sprintf("account %s: %v", acc.ID, prepared.err)
 				continue
 			}
 
@@ -465,10 +495,16 @@ func (d *Dispatcher) PlanWith(ctx context.Context, tenantID string, targets []Ta
 			if retryAfter < 0 {
 				retryAfter = 0
 			}
+			msg := "dispatch: all matching candidates are temporarily unavailable"
+			// Surface non-cooldown skips so a dead account (revoked refresh
+			// token, vault error) is not misdiagnosed as a plain rate limit.
+			if nonCooldownReason != "" {
+				msg += "; also skipped: " + nonCooldownReason
+			}
 			return nil, &core.ProviderError{
 				Kind:       core.ErrRateLimit,
 				Scope:      blockedScope,
-				Message:    "dispatch: all matching candidates are temporarily unavailable",
+				Message:    msg,
 				RetryAfter: retryAfter,
 			}
 		}
@@ -489,7 +525,9 @@ func (d *Dispatcher) PlanWith(ctx context.Context, tenantID string, targets []Ta
 
 // NoteFailure applies cooldowns to an account (and optionally a model) based on
 // a provider error. Exponential backoff increases the cooldown on repeated
-// failures for rate-limit / quota errors.
+// failures for rate-limit / quota errors. Concurrent failures on the same
+// account within FailureDedupWindow escalate once, and locally computed
+// cooldowns carry jitter so cooled accounts recover at staggered times.
 //
 // Two categories of error are explicitly NOT cooled down:
 //   - Client cancellations (user pressed Esc, client closed connection): the
@@ -518,6 +556,16 @@ func (d *Dispatcher) NoteFailure(ctx context.Context, accountID string, err *cor
 		}
 		err.RetryAfter = cooldown
 		if d.routing != nil && err.Model != "" {
+			if !d.shouldEscalateFailure(accountID+"\x00"+err.Model, time.Now()) {
+				// A concurrent failure already locked this model; report the
+				// cooldown it set instead of extending the lock again.
+				if exps, rerr := d.routing.ActiveCooldownExpirations(ctx, []string{accountID}, err.Model); rerr == nil {
+					if until, ok := exps[accountID]; ok {
+						err.RetryAfter = max(time.Until(until), 0)
+					}
+				}
+				return
+			}
 			_ = d.routing.SetModelCooldown(ctx, accountID, err.Model, time.Now().Add(cooldown))
 		}
 		return
@@ -530,14 +578,10 @@ func (d *Dispatcher) NoteFailure(ctx context.Context, accountID string, err *cor
 		return
 	}
 
-	var cooldown time.Duration
+	// Classify first so errors that never cool down cannot consume the dedup
+	// window and suppress a real cooldown moments later.
 	switch err.Kind {
-	case core.ErrRateLimit:
-		cooldown = d.exponentialCooldown(ctx, accountID)
-	case core.ErrQuotaExhausted:
-		cooldown = 30 * time.Minute
-	case core.ErrAuth:
-		cooldown = 5 * time.Minute
+	case core.ErrRateLimit, core.ErrQuotaExhausted, core.ErrAuth:
 	case core.ErrUpstream, core.ErrTimeout:
 		// Self-inflicted timeout: our own request deadline fired while the
 		// upstream was still processing. The provider is healthy — skip
@@ -546,11 +590,44 @@ func (d *Dispatcher) NoteFailure(ctx context.Context, accountID string, err *cor
 			errors.Is(err.Cause, context.DeadlineExceeded) {
 			return
 		}
-		// Transient errors: apply a short cooldown so the account gets a
-		// breather without being locked out for too long.
-		cooldown = TransientCooldown
 	default:
 		return
+	}
+
+	if !d.shouldEscalateFailure(accountID, time.Now()) {
+		// A concurrent failure already cooled this account down; report the
+		// cooldown it set instead of advancing the backoff level again.
+		if acc, aerr := d.accounts.Get(ctx, accountID); aerr == nil && acc.CooldownUntil != nil {
+			if remaining := time.Until(*acc.CooldownUntil); remaining > err.RetryAfter {
+				err.RetryAfter = remaining
+			}
+		}
+		return
+	}
+
+	var cooldown time.Duration
+	jitter := true
+	switch err.Kind {
+	case core.ErrRateLimit:
+		cooldown = d.exponentialCooldown(ctx, accountID)
+	case core.ErrQuotaExhausted:
+		cooldown = 30 * time.Minute
+		if err.CreditsExhausted {
+			// A depleted paid balance is terminal until the user tops up.
+			// Park the account for a day instead of thrashing through
+			// half-hour cooldowns; jitter is pointless at this horizon.
+			cooldown = CreditsExhaustedCooldown
+			jitter = false
+		}
+	case core.ErrAuth:
+		cooldown = 5 * time.Minute
+	default:
+		// Transient upstream errors: apply a short cooldown so the account
+		// gets a breather without being locked out for too long.
+		cooldown = TransientCooldown
+	}
+	if jitter {
+		cooldown = withJitter(cooldown)
 	}
 
 	// An upstream reset time is a lower bound. Never replace it with the much
@@ -562,6 +639,13 @@ func (d *Dispatcher) NoteFailure(ctx context.Context, accountID string, err *cor
 	err.RetryAfter = cooldown
 
 	_ = d.accounts.SetCooldown(ctx, accountID, time.Now().Add(cooldown))
+
+	// A depleted balance is terminal until the user tops up: flag the account
+	// so the dashboard can surface it and a manual reset can clear it. The
+	// flag also clears automatically on the next successful request.
+	if err.Kind == core.ErrQuotaExhausted && err.CreditsExhausted {
+		_ = d.accounts.SetCreditsExhausted(ctx, accountID, true)
+	}
 
 	// Also set a model-level cooldown when a model is specified, so other
 	// models on the same account remain available.
@@ -575,6 +659,14 @@ func (d *Dispatcher) NoteFailure(ctx context.Context, accountID string, err *cor
 // cooldown. Called by the pipeline after a successful upstream response.
 func (d *Dispatcher) NoteSuccess(ctx context.Context, provider, accountID, model string) {
 	_ = d.accounts.ResetBackoffLevel(ctx, accountID)
+	// A success proves the account recovered, so a later failure is a fresh
+	// incident rather than part of the burst that set the dedup marker.
+	d.failureMu.Lock()
+	delete(d.recentFailures, accountID)
+	if model != "" {
+		delete(d.recentFailures, accountID+"\x00"+model)
+	}
+	d.failureMu.Unlock()
 	if d.routing != nil && model != "" {
 		_ = d.routing.ClearModelCooldown(ctx, accountID, model)
 	}
@@ -582,6 +674,44 @@ func (d *Dispatcher) NoteSuccess(ctx context.Context, provider, accountID, model
 		_ = d.health.MarkHealthy(ctx, accountID, model)
 	}
 	d.recordProviderSuccess(provider)
+}
+
+// shouldEscalateFailure reports whether this failure should escalate cooldown
+// state for key, recording it when so. Failures arriving within
+// FailureDedupWindow of a recorded one are collapsed: a burst of parallel
+// requests dying on the same credential is one incident, not N, so the backoff
+// level advances a single step and the cooldown horizon is set once.
+func (d *Dispatcher) shouldEscalateFailure(key string, now time.Time) bool {
+	d.failureMu.Lock()
+	defer d.failureMu.Unlock()
+	if last, ok := d.recentFailures[key]; ok && now.Sub(last) < FailureDedupWindow {
+		return false
+	}
+	if len(d.recentFailures) >= maxRecentFailureEntries {
+		for k, ts := range d.recentFailures {
+			if now.Sub(ts) >= FailureDedupWindow {
+				delete(d.recentFailures, k)
+			}
+		}
+	}
+	d.recentFailures[key] = now
+	return true
+}
+
+// withJitter extends a locally computed cooldown by a random amount up to
+// BackoffJitterFraction of its length. Accounts that fail together (e.g. a
+// shared quota window closing) then recover at staggered times instead of
+// receiving the retry burst simultaneously. Jitter is never applied to
+// upstream-specified Retry-After values, which remain exact lower bounds.
+func withJitter(cooldown time.Duration) time.Duration {
+	if cooldown <= 0 {
+		return cooldown
+	}
+	span := int64(float64(cooldown) * BackoffJitterFraction)
+	if span <= 0 {
+		return cooldown
+	}
+	return cooldown + time.Duration(rand.Int64N(span+1))
 }
 
 // exponentialCooldown computes the cooldown duration using exponential backoff.

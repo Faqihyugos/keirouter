@@ -98,8 +98,12 @@ var configs = map[string]ProviderConfig{
 		AuthorizeURL:              "https://auth.openai.com/oauth/authorize",
 		TokenURL:                  "https://auth.openai.com/oauth/token",
 		Scopes:                    []string{"openid", "profile", "email", "offline_access"},
-		ExtraAuthParams:           map[string]string{"id_token_add_organizations": "true", "codex_cli_simplified_flow": "true", "originator": "codex_cli_rs"},
-		ExtraAuthParamOrder:       []string{"id_token_add_organizations", "codex_cli_simplified_flow", "originator"},
+		// prompt=login forces a fresh Auth0 session per flow. Without it, a
+		// second Codex OAuth on the same browser reuses the first session and
+		// Auth0 invalidates the earlier account's refresh-token family as a
+		// "session takeover", breaking multi-account setups.
+		ExtraAuthParams:           map[string]string{"id_token_add_organizations": "true", "codex_cli_simplified_flow": "true", "originator": "codex_cli_rs", "prompt": "login"},
+		ExtraAuthParamOrder:       []string{"id_token_add_organizations", "codex_cli_simplified_flow", "originator", "prompt"},
 		EncodeAuthSpacesAsPercent: true,
 		CallbackPath:              "/auth/callback",
 		FixedLoopbackPort:         1455,

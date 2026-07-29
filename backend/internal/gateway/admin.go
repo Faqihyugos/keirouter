@@ -640,8 +640,9 @@ func (s *Server) adminListAccounts(w http.ResponseWriter, r *http.Request) {
 			"id": a.ID, "provider": a.Provider, "label": a.Label,
 			"auth_kind": a.AuthKind, "priority": a.Priority,
 			"disabled": a.Disabled, "proxy_pool_id": a.ProxyPoolID,
-			"needs_reconnect": a.NeedsReconnect,
-			"created_at":      a.CreatedAt,
+			"needs_reconnect":   a.NeedsReconnect,
+			"credits_exhausted": a.CreditsExhausted,
+			"created_at":        a.CreatedAt,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})

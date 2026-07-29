@@ -71,6 +71,11 @@ type ProviderError struct {
 	Message string
 	// RetryAfter, when non-zero, is the upstream-suggested cooldown.
 	RetryAfter time.Duration
+	// CreditsExhausted marks a quota_exhausted error caused by a depleted
+	// paid balance rather than a scheduled quota window. A dry balance never
+	// recovers on its own — the user must top up — so the dispatcher parks
+	// the account for a long horizon and flags it for the dashboard.
+	CreditsExhausted bool
 	// RetrySystemInstruction requests one centrally routed retry with an
 	// additional system instruction. Connectors use this for completed
 	// responses that are structurally invalid or clearly incomplete.

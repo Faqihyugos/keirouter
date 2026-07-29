@@ -2132,6 +2132,50 @@ function AuthCodeFlow({ provider, onClose }: { provider: OAuthProvider; onClose:
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [waiting, provider.provider]);
 
+  // Poll the gateway for server-side completion in parallel with the
+  // postMessage listener. postMessage alone is not enough: providers that set
+  // Cross-Origin-Opener-Policy on their auth pages (OpenAI/Codex) sever
+  // window.opener during the redirect, so the popup can never notify us and
+  // the user would be forced into pasting the callback URL manually.
+  useEffect(() => {
+    if (!waiting || !stateRef.current) return;
+    let stopped = false;
+    let timer = 0;
+    let expiredPolls = 0;
+    const tick = async () => {
+      try {
+        const res = await api.oauthCallbackStatus(provider.provider, stateRef.current);
+        if (stopped) return;
+        if (res.status === "success") {
+          finishSuccess();
+          return;
+        }
+        if (res.status === "error") {
+          setError(res.message || "Connection failed.");
+          setWaiting(false);
+          return;
+        }
+        // The session lives ~10 minutes; a few consecutive "expired" polls
+        // mean it is genuinely gone and the user should restart the flow.
+        if (res.status === "expired" && ++expiredPolls >= 3) {
+          setError("Sign-in session expired. Please try again.");
+          setWaiting(false);
+          return;
+        }
+        if (res.status === "pending") expiredPolls = 0;
+      } catch {
+        // Transient poll failures are ignored; the next tick retries.
+      }
+      if (!stopped) timer = window.setTimeout(tick, 2000);
+    };
+    timer = window.setTimeout(tick, 2000);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [waiting, provider.provider]);
+
   const start = async () => {
     setError("");
     try {

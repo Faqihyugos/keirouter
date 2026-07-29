@@ -20,7 +20,7 @@ const accountColumns = `id, tenant_id, provider, label, auth_kind,
 	token_wrapped_dek, token_ciphertext,
 	refresh_wrapped_dek, refresh_ciphertext,
 	token_expires_at, metadata, priority, backoff_level, disabled, cooldown_until,
-	proxy_pool_id, needs_reconnect, created_at, updated_at`
+	proxy_pool_id, needs_reconnect, credits_exhausted, created_at, updated_at`
 
 // SetBackoffLevel updates the exponential backoff level for an account.
 func (r *AccountRepo) SetBackoffLevel(ctx context.Context, id string, level int) error {
@@ -30,9 +30,10 @@ func (r *AccountRepo) SetBackoffLevel(ctx context.Context, id string, level int)
 }
 
 // ResetBackoffLevel resets the exponential backoff level to 0 and clears
-// cooldown, called on a successful request.
+// cooldown and the credits-exhausted flag, called on a successful request
+// (a success proves the balance covers traffic again).
 func (r *AccountRepo) ResetBackoffLevel(ctx context.Context, id string) error {
-	q := r.db.rebind(`UPDATE accounts SET backoff_level = 0, cooldown_until = NULL, updated_at = ? WHERE id = ?`)
+	q := r.db.rebind(`UPDATE accounts SET backoff_level = 0, cooldown_until = NULL, credits_exhausted = 0, updated_at = ? WHERE id = ?`)
 	_, err := r.db.sql.ExecContext(ctx, q, formatTime(time.Now()), id)
 	return err
 }
@@ -40,7 +41,7 @@ func (r *AccountRepo) ResetBackoffLevel(ctx context.Context, id string) error {
 // Create inserts a new account.
 func (r *AccountRepo) Create(ctx context.Context, a Account) error {
 	q := r.db.rebind(`INSERT INTO accounts (` + accountColumns + `)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	_, err := r.db.sql.ExecContext(ctx, q,
 		a.ID, a.TenantID, a.Provider, a.Label, string(a.AuthKind),
 		nullString(a.SecretWrappedDEK), nullString(a.SecretCiphertext),
@@ -48,7 +49,7 @@ func (r *AccountRepo) Create(ctx context.Context, a Account) error {
 		nullString(a.RefreshWrappedDEK), nullString(a.RefreshCiphertext),
 		nullTime(a.TokenExpiresAt), a.Metadata, a.Priority, a.BackoffLevel,
 		boolToInt(a.Disabled), nullTime(a.CooldownUntil), a.ProxyPoolID,
-		boolToInt(a.NeedsReconnect),
+		boolToInt(a.NeedsReconnect), boolToInt(a.CreditsExhausted),
 		formatTime(a.CreatedAt), formatTime(a.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("store: create account: %w", err)
@@ -157,7 +158,7 @@ func (r *AccountRepo) Update(ctx context.Context, a Account) error {
 // cooldown has already expired. Called on startup so stale cooldowns from a
 // previous session don't block fresh requests.
 func (r *AccountRepo) ClearExpiredCooldowns(ctx context.Context) (int64, error) {
-	q := r.db.rebind(`UPDATE accounts SET cooldown_until = NULL, backoff_level = 0, updated_at = ? WHERE cooldown_until IS NOT NULL AND cooldown_until < ?`)
+	q := r.db.rebind(`UPDATE accounts SET cooldown_until = NULL, backoff_level = 0, credits_exhausted = 0, updated_at = ? WHERE cooldown_until IS NOT NULL AND cooldown_until < ?`)
 	res, err := r.db.sql.ExecContext(ctx, q, formatTime(time.Now()), formatTime(time.Now()))
 	if err != nil {
 		return 0, fmt.Errorf("store: clear expired cooldowns: %w", err)
@@ -173,8 +174,8 @@ func (r *AccountRepo) ClearExpiredCooldowns(ctx context.Context) (int64, error) 
 // is accessible again.
 func (r *AccountRepo) ClearProviderCooldowns(ctx context.Context, tenantID, provider string) error {
 	q := r.db.rebind(`UPDATE accounts SET cooldown_until = NULL, backoff_level = 0,
-		needs_reconnect = 0, updated_at = ?
-		WHERE tenant_id = ? AND provider = ? AND (cooldown_until IS NOT NULL OR needs_reconnect != 0)`)
+		needs_reconnect = 0, credits_exhausted = 0, updated_at = ?
+		WHERE tenant_id = ? AND provider = ? AND (cooldown_until IS NOT NULL OR needs_reconnect != 0 OR credits_exhausted != 0)`)
 	_, err := r.db.sql.ExecContext(ctx, q, formatTime(time.Now()), tenantID, provider)
 	if err != nil {
 		return fmt.Errorf("store: clear provider cooldowns: %w", err)
@@ -215,6 +216,16 @@ func (r *AccountRepo) SetNeedsReconnect(ctx context.Context, id string, flag boo
 	return err
 }
 
+// SetCreditsExhausted marks an account's paid balance as depleted (or clears
+// the flag). Set by the dispatcher when a provider reports the balance is
+// dry; cleared by a successful request, a provider reconnect, or expiry of
+// the parking cooldown.
+func (r *AccountRepo) SetCreditsExhausted(ctx context.Context, id string, flag bool) error {
+	q := r.db.rebind(`UPDATE accounts SET credits_exhausted = ?, updated_at = ? WHERE id = ?`)
+	_, err := r.db.sql.ExecContext(ctx, q, boolToInt(flag), formatTime(time.Now()), id)
+	return err
+}
+
 func (r *AccountRepo) queryList(ctx context.Context, q string, args ...any) ([]Account, error) {
 	rows, err := r.db.sql.QueryContext(ctx, q, args...)
 	if err != nil {
@@ -249,16 +260,17 @@ func scanAccountRow(scan func(dest ...any) error) (Account, error) {
 		backoffLevel   int
 		cooldown       sql.NullString
 		disabled       int
-		proxyPoolID    sql.NullString
-		needsReconnect int
-		createdRaw     string
-		updatedRaw     string
+		proxyPoolID      sql.NullString
+		needsReconnect   int
+		creditsExhausted int
+		createdRaw       string
+		updatedRaw       string
 	)
 	err := scan(
 		&a.ID, &a.TenantID, &a.Provider, &a.Label, &authKind,
 		&secretDEK, &secretCT, &tokenDEK, &tokenCT, &refreshDEK, &refreshCT,
 		&tokenExpires, &a.Metadata, &a.Priority, &backoffLevel, &disabled, &cooldown,
-		&proxyPoolID, &needsReconnect, &createdRaw, &updatedRaw,
+		&proxyPoolID, &needsReconnect, &creditsExhausted, &createdRaw, &updatedRaw,
 	)
 	if err != nil {
 		return Account{}, err
@@ -274,6 +286,7 @@ func scanAccountRow(scan func(dest ...any) error) (Account, error) {
 	a.Disabled = disabled != 0
 	a.ProxyPoolID = proxyPoolID.String
 	a.NeedsReconnect = needsReconnect != 0
+	a.CreditsExhausted = creditsExhausted != 0
 	a.CreatedAt = parseTime(createdRaw)
 	a.UpdatedAt = parseTime(updatedRaw)
 	if tokenExpires.Valid {

@@ -404,3 +404,23 @@ func toStrings(b [][]byte) []string {
 	}
 	return out
 }
+
+// TestClassifyRespStreamError verifies that in-stream error events (HTTP 200
+// with an error in the SSE body) are scoped correctly: request problems must
+// not cool down accounts or trip the provider circuit breaker.
+func TestClassifyRespStreamError(t *testing.T) {
+	// The reported failure: Codex context overflow arrives in-stream.
+	pe := classifyRespStreamError("Your input exceeds the context window of this model. Please adjust your input and try again.")
+	require.Equal(t, core.ErrBadRequest, pe.Kind)
+	require.Equal(t, core.FailureScopeRequest, pe.EffectiveScope())
+	require.False(t, pe.Fallbackable())
+
+	pe = classifyRespStreamError("The 'gpt-5-6' model is not supported when using Codex with a ChatGPT account.")
+	require.Equal(t, core.ErrModelUnavailable, pe.Kind)
+	require.Equal(t, core.FailureScopeModel, pe.EffectiveScope())
+
+	// Anything else stays a provider-scoped upstream error.
+	pe = classifyRespStreamError("server_is_overloaded")
+	require.Equal(t, core.ErrUpstream, pe.Kind)
+	require.Equal(t, core.FailureScopeProvider, pe.EffectiveScope())
+}
