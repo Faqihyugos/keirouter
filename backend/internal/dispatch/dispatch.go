@@ -594,7 +594,11 @@ func (d *Dispatcher) NoteFailure(ctx context.Context, accountID string, err *cor
 		return
 	}
 
-	if !d.shouldEscalateFailure(accountID, time.Now()) {
+	// A depleted paid balance is terminal: the 24h park and credits flag are
+	// semantically stronger than whatever short cooldown a concurrent failure
+	// in the same burst may have set, so it must not be deduped away.
+	creditsExhausted := err.Kind == core.ErrQuotaExhausted && err.CreditsExhausted
+	if !d.shouldEscalateFailure(accountID, time.Now()) && !creditsExhausted {
 		// A concurrent failure already cooled this account down; report the
 		// cooldown it set instead of advancing the backoff level again.
 		if acc, aerr := d.accounts.Get(ctx, accountID); aerr == nil && acc.CooldownUntil != nil {
@@ -643,7 +647,7 @@ func (d *Dispatcher) NoteFailure(ctx context.Context, accountID string, err *cor
 	// A depleted balance is terminal until the user tops up: flag the account
 	// so the dashboard can surface it and a manual reset can clear it. The
 	// flag also clears automatically on the next successful request.
-	if err.Kind == core.ErrQuotaExhausted && err.CreditsExhausted {
+	if creditsExhausted {
 		_ = d.accounts.SetCreditsExhausted(ctx, accountID, true)
 	}
 

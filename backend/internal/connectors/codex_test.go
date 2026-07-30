@@ -35,6 +35,10 @@ func TestResolveCodexModel(t *testing.T) {
 		{"gpt-5.1-codex-max", "gpt-5.1-codex-max", ""},
 		// Unknown ids pass through (normalized) for upstream to decide.
 		{"gpt-5.9-nova", "gpt-5.9-nova", ""},
+		{"gpt-5-1-codex", "gpt-5.1-codex", ""},
+		// The dash-typo rewrite is anchored to the version segment: a
+		// date-suffixed snapshot id must survive untouched.
+		{"gpt-5.1-codex-max-2025-11-13", "gpt-5.1-codex-max-2025-11-13", ""},
 	}
 	for _, tc := range cases {
 		model, effort := resolveCodexModel(tc.in)

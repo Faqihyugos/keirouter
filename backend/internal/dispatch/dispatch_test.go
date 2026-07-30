@@ -367,6 +367,27 @@ func TestNoteFailureCreditsExhaustedParksAccount(t *testing.T) {
 	require.Nil(t, account.CooldownUntil)
 }
 
+func TestNoteFailureCreditsExhaustedBypassesDedup(t *testing.T) {
+	ctx := context.Background()
+	d, db := newDispatchTest(t, testAccount("acc-dry-burst", 10))
+
+	// A rate-limit failure consumes the dedup window first; the terminal
+	// credits failure arriving inside the window must still park and flag
+	// the account instead of being collapsed into the short cooldown.
+	d.NoteFailure(ctx, "acc-dry-burst", &core.ProviderError{Kind: core.ErrRateLimit})
+	d.NoteFailure(ctx, "acc-dry-burst", &core.ProviderError{
+		Kind:             core.ErrQuotaExhausted,
+		CreditsExhausted: true,
+	})
+
+	account, err := db.Accounts().Get(ctx, "acc-dry-burst")
+	require.NoError(t, err)
+	require.True(t, account.CreditsExhausted, "the terminal credits flag must not be deduped away")
+	require.NotNil(t, account.CooldownUntil)
+	require.WithinDuration(t, time.Now().Add(CreditsExhaustedCooldown), *account.CooldownUntil, time.Minute,
+		"the 24h park must replace the short rate-limit cooldown")
+}
+
 func TestNoteFailurePlainQuotaDoesNotFlagCredits(t *testing.T) {
 	ctx := context.Background()
 	d, db := newDispatchTest(t, testAccount("acc-quota", 10))

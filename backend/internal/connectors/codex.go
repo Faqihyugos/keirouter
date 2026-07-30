@@ -31,10 +31,13 @@ var codexModelAliases = map[string]string{
 	"gpt-5.6": "gpt-5.6-sol",
 }
 
-// codexDashVersion matches a dash between two digits ("gpt-5-6"), the common
-// misspelling of the dotted version ids ("gpt-5.6") Codex actually uses.
-// Sending the dashed form upstream fails with 400 "model is not supported".
-var codexDashVersion = regexp.MustCompile(`(\d)-(\d)`)
+// codexDashVersion matches a dashed version segment right after the "gpt"
+// prefix ("gpt-5-6"), the common misspelling of the dotted version ids
+// ("gpt-5.6") Codex actually uses — sending the dashed form upstream fails
+// with 400 "model is not supported". Anchoring to the prefix keeps later
+// digit-dash-digit runs intact, e.g. a date-suffixed snapshot id like
+// "gpt-5.1-codex-max-2025-11-13".
+var codexDashVersion = regexp.MustCompile(`^(gpt-\d+)-(\d+)`)
 
 // codexModelKnown reports whether id is in the curated Codex catalog.
 func codexModelKnown(id string) bool {

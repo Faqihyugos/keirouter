@@ -419,6 +419,11 @@ func TestClassifyRespStreamError(t *testing.T) {
 	require.Equal(t, core.ErrModelUnavailable, pe.Kind)
 	require.Equal(t, core.FailureScopeModel, pe.EffectiveScope())
 
+	// A TPM rate limit mentions token counts too; it must classify as a rate
+	// limit (account cooldown) and never as request-scoped context overflow.
+	pe = classifyRespStreamError("Rate limit reached for gpt-5-codex: too many tokens per min. Limit 30000, Requested 31000.")
+	require.Equal(t, core.ErrRateLimit, pe.Kind)
+
 	// Anything else stays a provider-scoped upstream error.
 	pe = classifyRespStreamError("server_is_overloaded")
 	require.Equal(t, core.ErrUpstream, pe.Kind)

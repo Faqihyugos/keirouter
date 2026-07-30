@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/mydisha/keirouter/backend/internal/core"
 	qoderlib "github.com/mydisha/keirouter/backend/internal/qoder"
@@ -40,13 +41,19 @@ type Qoder struct {
 	// Model catalog cache (COSY-signed /algo/api/v2/model/list).
 	mu      sync.RWMutex
 	catalog map[string]*qoderCatalogEntry // keyed by user_id
-
-	// Resolved-session cache for PAT connections, keyed by the pt-* token. A
-	// PAT is exchanged for a short-lived jt-* job token and the owner's real
-	// COSY identity (uid/email/name), reused until the job token nears expiry.
-	jtMu        sync.Mutex
-	patSessions map[string]qoderPATSession
 }
+
+// qoderPATCache is the process-wide resolved-session cache for PAT
+// connections, keyed by the pt-* token. It is shared by every Qoder instance
+// (dispatch connectors and the quota source) and the exchange is
+// single-flighted, so each PAT holds at most one live jt-* job token at a
+// time even under concurrent cold-cache requests — the upstream may
+// invalidate earlier job tokens when a new one is minted.
+var qoderPATCache = struct {
+	sync.Mutex
+	sessions map[string]qoderPATSession
+	flight   singleflight.Group
+}{sessions: make(map[string]qoderPATSession)}
 
 // qoderCatalogEntry is a cached model catalog for one Qoder account.
 type qoderCatalogEntry struct {
@@ -83,7 +90,6 @@ func NewQoder(id, defaultBaseURL string) *Qoder {
 		id:          id,
 		defaultBase: defaultBaseURL,
 		catalog:     make(map[string]*qoderCatalogEntry),
-		patSessions: make(map[string]qoderPATSession),
 	}
 }
 
@@ -171,34 +177,51 @@ func (c *Qoder) resolveCosyCreds(ctx context.Context, creds core.Credentials) (q
 
 // resolveQoderSession returns a cached job token plus the owner's real COSY
 // identity for the PAT, refreshing when the cache is empty or near expiry.
+// The refresh is single-flighted per PAT: concurrent cold-cache callers share
+// one exchange instead of minting competing job tokens.
 func (c *Qoder) resolveQoderSession(ctx context.Context, pat string) (qoderPATSession, error) {
-	c.jtMu.Lock()
-	if sess, ok := c.patSessions[pat]; ok && time.Now().Before(sess.expiresAt) {
-		c.jtMu.Unlock()
+	qoderPATCache.Lock()
+	if sess, ok := qoderPATCache.sessions[pat]; ok && time.Now().Before(sess.expiresAt) {
+		qoderPATCache.Unlock()
 		return sess, nil
 	}
-	c.jtMu.Unlock()
+	qoderPATCache.Unlock()
 
-	token, ttl, err := c.exchangeJobToken(ctx, pat)
+	v, err, _ := qoderPATCache.flight.Do(pat, func() (any, error) {
+		// A previous flight may have refreshed the session while this caller
+		// was queued behind it.
+		qoderPATCache.Lock()
+		if sess, ok := qoderPATCache.sessions[pat]; ok && time.Now().Before(sess.expiresAt) {
+			qoderPATCache.Unlock()
+			return sess, nil
+		}
+		qoderPATCache.Unlock()
+
+		token, ttl, err := c.exchangeJobToken(ctx, pat)
+		if err != nil {
+			return qoderPATSession{}, err
+		}
+		st, err := c.fetchUserStatus(ctx, token)
+		if err != nil {
+			return qoderPATSession{}, err
+		}
+
+		sess := qoderPATSession{
+			jobToken:  token,
+			uid:       st.ID,
+			email:     st.Email,
+			name:      st.Name,
+			expiresAt: time.Now().Add(ttl),
+		}
+		qoderPATCache.Lock()
+		qoderPATCache.sessions[pat] = sess
+		qoderPATCache.Unlock()
+		return sess, nil
+	})
 	if err != nil {
 		return qoderPATSession{}, err
 	}
-	st, err := c.fetchUserStatus(ctx, token)
-	if err != nil {
-		return qoderPATSession{}, err
-	}
-
-	sess := qoderPATSession{
-		jobToken:  token,
-		uid:       st.ID,
-		email:     st.Email,
-		name:      st.Name,
-		expiresAt: time.Now().Add(ttl),
-	}
-	c.jtMu.Lock()
-	c.patSessions[pat] = sess
-	c.jtMu.Unlock()
-	return sess, nil
+	return v.(qoderPATSession), nil
 }
 
 // qoderUserStatus is the token owner's account profile from user/status. The
@@ -256,9 +279,9 @@ func (c *Qoder) fetchUserStatus(ctx context.Context, jobToken string) (*qoderUse
 // --- Quota -----------------------------------------------------------------
 
 func init() {
-	// Register a self-contained instance for quota lookups. NewQoder is required
-	// (not a bare &Qoder{}) so the patSessions map is initialised before
-	// FetchQuota resolves a job token.
+	// Register an instance for quota lookups. PAT sessions live in the shared
+	// package-level qoderPATCache, so quota fetches reuse the job token minted
+	// by the dispatch connector instead of performing a second exchange.
 	RegisterQuotaSource("qoder", NewQoder("qoder", ""))
 }
 

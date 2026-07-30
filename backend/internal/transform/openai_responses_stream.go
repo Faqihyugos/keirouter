@@ -152,6 +152,12 @@ func (OpenAIResponsesCodec) ParseStreamLine(line []byte, _ string) ([]core.Strea
 func classifyRespStreamError(msg string) *core.ProviderError {
 	m := strings.ToLower(msg)
 	switch {
+	// Rate limits mention token counts too ("Rate limit reached … too many
+	// tokens per min"); match the rate-limit vocabulary first so a TPM limit
+	// is never mistaken for context overflow below and left without cooldown.
+	case strings.Contains(m, "rate limit") || strings.Contains(m, "rate_limit") ||
+		strings.Contains(m, "tokens per min"):
+		return &core.ProviderError{Kind: core.ErrRateLimit, Message: msg}
 	// Context overflow: the request itself is too large. Only the client can
 	// fix it (compact/trim), so scope it to the request — no cooldown, no
 	// fallback, surface the error straight back.
