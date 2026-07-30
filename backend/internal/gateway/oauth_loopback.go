@@ -134,6 +134,17 @@ func (s *Server) oauthFixedLoopbackCallback(provider string, w http.ResponseWrit
 }
 
 func (s *Server) completeOAuthCallback(r *http.Request, providerHint string) error {
+	err := s.finishOAuthCallback(r, providerHint)
+	// Record the outcome keyed by state so the dashboard's completion polling
+	// works even when the popup can't reach the opener (COOP severs
+	// window.opener on some providers' auth pages, e.g. OpenAI/Codex).
+	if state := r.URL.Query().Get("state"); state != "" {
+		recordOAuthResult(state, providerHint, err)
+	}
+	return err
+}
+
+func (s *Server) finishOAuthCallback(r *http.Request, providerHint string) error {
 	code := r.URL.Query().Get("code")
 	state := r.URL.Query().Get("state")
 	if errParam := r.URL.Query().Get("error"); errParam != "" {

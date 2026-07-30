@@ -113,8 +113,9 @@ func freeProviders() []ProviderSpec {
 			Color: "#4285F4", Website: "https://github.com/google-gemini/gemini-cli", Deprecated: true, Notice: risk},
 		{ID: "qoder", DisplayName: "Qoder", Alias: "qd", Dialect: core.DialectQoder,
 			BaseURL:  "https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation",
-			AuthKind: "oauth", AuthModes: []string{"oauth"}, ServiceKinds: llm(),
-			Color: "#EC4899", Website: "https://qoder.com", Deprecated: true, Notice: risk},
+			AuthKind: "oauth", AuthModes: []string{"oauth", "api_key"}, ServiceKinds: llm(),
+			Color: "#EC4899", Website: "https://qoder.com", APIKeyURL: "https://qoder.com/account/integrations",
+			Deprecated: true, Notice: risk},
 	}
 }
 

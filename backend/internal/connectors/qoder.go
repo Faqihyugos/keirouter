@@ -1,6 +1,7 @@
 package connectors
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/mydisha/keirouter/backend/internal/core"
 	qoderlib "github.com/mydisha/keirouter/backend/internal/qoder"
@@ -24,6 +26,13 @@ import (
 //   - WAF-bypass body encoding (&Encode=1)
 //   - COSY signing (RSA+AES+MD5 with ~17 Cosy-* headers)
 //   - SSE envelope unwrapping ({statusCodeValue, body} → plain OpenAI chunks)
+//
+// Two auth methods are supported. OAuth device-token connections store
+// user_id/machine_id/email in creds.Extra and carry the access token as the
+// COSY security_oauth_token. Personal Access Token (PAT, pt-*) connections
+// carry the PAT in creds.APIKey; a raw PAT cannot sign COSY directly, so it is
+// first exchanged for a short-lived job token (jt-*) that becomes the COSY
+// security_oauth_token (mirrors qodercli's headless PAT flow).
 type Qoder struct {
 	id          string
 	defaultBase string
@@ -34,13 +43,46 @@ type Qoder struct {
 	catalog map[string]*qoderCatalogEntry // keyed by user_id
 }
 
+// qoderPATCache is the process-wide resolved-session cache for PAT
+// connections, keyed by the pt-* token. It is shared by every Qoder instance
+// (dispatch connectors and the quota source) and the exchange is
+// single-flighted, so each PAT holds at most one live jt-* job token at a
+// time even under concurrent cold-cache requests — the upstream may
+// invalidate earlier job tokens when a new one is minted.
+var qoderPATCache = struct {
+	sync.Mutex
+	sessions map[string]qoderPATSession
+	flight   singleflight.Group
+}{sessions: make(map[string]qoderPATSession)}
+
 // qoderCatalogEntry is a cached model catalog for one Qoder account.
 type qoderCatalogEntry struct {
 	fetchedAt  time.Time
 	rawConfigs map[string]json.RawMessage // key → full model_config JSON
 }
 
+// qoderPATSession is a cached PAT resolution: the exchanged jt-* job token
+// plus the token owner's real COSY identity fetched from user/status. The
+// COSY envelope's uid must be this real user id, not a synthetic value.
+type qoderPATSession struct {
+	jobToken  string
+	uid       string
+	email     string
+	name      string
+	expiresAt time.Time
+}
+
 const qoderCatalogTTL = 1 * time.Hour
+
+// Job-token lifetime bounds. Qoder issues job tokens valid for ~24h; refresh a
+// little early to avoid signing with a just-expired token.
+const (
+	qoderJobTokenDefaultTTL = 23 * time.Hour
+	qoderJobTokenMinTTL     = 1 * time.Minute
+	// qoderJobTokenRefreshSkew refreshes the job token a little before its
+	// reported expiry so a signed request never uses a just-expired token.
+	qoderJobTokenRefreshSkew = 5 * time.Minute
+)
 
 // NewQoder builds a Qoder connector.
 func NewQoder(id, defaultBaseURL string) *Qoder {
@@ -69,9 +111,38 @@ func (c *Qoder) cosyCreds(creds core.Credentials) qoderlib.CosyCreds {
 	}
 }
 
+// qoderPATToken resolves the raw Personal Access Token from the credentials.
+// The PAT arrives in the dedicated APIKey field; imported connections may
+// carry it as the access token instead.
+func qoderPATToken(creds core.Credentials) string {
+	if creds.APIKey != "" {
+		return creds.APIKey
+	}
+	return creds.AccessToken
+}
+
+// qoderIsPAT reports whether the credentials authenticate with a Personal
+// Access Token rather than an OAuth device-token session. Account creation
+// marks PAT connections with qoder_auth_method=pat; the pt-* prefix is a
+// belt-and-suspenders fallback for imported credentials.
+func qoderIsPAT(creds core.Credentials) bool {
+	if creds.Extra["qoder_auth_method"] == "pat" {
+		return true
+	}
+	return strings.HasPrefix(strings.TrimSpace(qoderPATToken(creds)), "pt-")
+}
+
 // validateCreds returns an error when the credential is missing the fields
-// required for COSY signing.
+// required for COSY signing. PAT connections only need the PAT itself (the
+// job token and synthetic uid are derived at request time); OAuth connections
+// need the user_id and access token captured at connect time.
 func (c *Qoder) validateCreds(creds core.Credentials) error {
+	if qoderIsPAT(creds) {
+		if qoderPATToken(creds) == "" {
+			return &core.ProviderError{Kind: core.ErrAuth, Provider: c.id, Message: "qoder credential is missing personal access token; reconnect the account"}
+		}
+		return nil
+	}
 	cc := c.cosyCreds(creds)
 	if cc.UserID == "" {
 		return &core.ProviderError{Kind: core.ErrAuth, Provider: c.id, Message: "qoder credential is missing user_id; reconnect the account"}
@@ -80,6 +151,343 @@ func (c *Qoder) validateCreds(creds core.Credentials) error {
 		return &core.ProviderError{Kind: core.ErrAuth, Provider: c.id, Message: "qoder credential is missing access token; reconnect the account"}
 	}
 	return nil
+}
+
+// resolveCosyCreds returns the COSY signing material for a request. OAuth
+// connections use their stored fields directly. PAT connections exchange the
+// PAT for a short-lived job token and pair it with the token owner's real
+// user id (fetched from user/status) — the upstream rejects a synthetic uid
+// with "Login expired".
+func (c *Qoder) resolveCosyCreds(ctx context.Context, creds core.Credentials) (qoderlib.CosyCreds, error) {
+	if !qoderIsPAT(creds) {
+		return c.cosyCreds(creds), nil
+	}
+	sess, err := c.resolveQoderSession(ctx, qoderPATToken(creds))
+	if err != nil {
+		return qoderlib.CosyCreds{}, err
+	}
+	return qoderlib.CosyCreds{
+		UserID:    sess.uid,
+		AuthToken: sess.jobToken,
+		Name:      sess.name,
+		Email:     sess.email,
+		MachineID: creds.Extra["machine_id"],
+	}, nil
+}
+
+// resolveQoderSession returns a cached job token plus the owner's real COSY
+// identity for the PAT, refreshing when the cache is empty or near expiry.
+// The refresh is single-flighted per PAT: concurrent cold-cache callers share
+// one exchange instead of minting competing job tokens.
+func (c *Qoder) resolveQoderSession(ctx context.Context, pat string) (qoderPATSession, error) {
+	qoderPATCache.Lock()
+	if sess, ok := qoderPATCache.sessions[pat]; ok && time.Now().Before(sess.expiresAt) {
+		qoderPATCache.Unlock()
+		return sess, nil
+	}
+	qoderPATCache.Unlock()
+
+	v, err, _ := qoderPATCache.flight.Do(pat, func() (any, error) {
+		// A previous flight may have refreshed the session while this caller
+		// was queued behind it.
+		qoderPATCache.Lock()
+		if sess, ok := qoderPATCache.sessions[pat]; ok && time.Now().Before(sess.expiresAt) {
+			qoderPATCache.Unlock()
+			return sess, nil
+		}
+		qoderPATCache.Unlock()
+
+		token, ttl, err := c.exchangeJobToken(ctx, pat)
+		if err != nil {
+			return qoderPATSession{}, err
+		}
+		st, err := c.fetchUserStatus(ctx, token)
+		if err != nil {
+			return qoderPATSession{}, err
+		}
+
+		sess := qoderPATSession{
+			jobToken:  token,
+			uid:       st.ID,
+			email:     st.Email,
+			name:      st.Name,
+			expiresAt: time.Now().Add(ttl),
+		}
+		qoderPATCache.Lock()
+		qoderPATCache.sessions[pat] = sess
+		qoderPATCache.Unlock()
+		return sess, nil
+	})
+	if err != nil {
+		return qoderPATSession{}, err
+	}
+	return v.(qoderPATSession), nil
+}
+
+// qoderUserStatus is the token owner's account profile from user/status. The
+// id is the real COSY uid; email/name fill the COSY user-info envelope; the
+// plan/quota fields drive the account quota panel.
+type qoderUserStatus struct {
+	ID              string  `json:"id"`
+	Name            string  `json:"name"`
+	Email           string  `json:"email"`
+	UserType        string  `json:"userType"`
+	Quota           float64 `json:"quota"`
+	IsQuotaExceeded bool    `json:"isQuotaExceeded"`
+	Plan            string  `json:"plan"`
+	UserTag         string  `json:"userTag"`
+	NextResetAt     int64   `json:"nextResetAt"`
+}
+
+// fetchUserStatus reads the token owner's account profile from user/status
+// using a plain Bearer job token (no COSY). The returned id is the real COSY
+// uid; email and name fill the COSY user-info envelope; plan/quota fields feed
+// FetchQuota.
+func (c *Qoder) fetchUserStatus(ctx context.Context, jobToken string) (*qoderUserStatus, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, qoderlib.UserStatusURL, nil)
+	if err != nil {
+		return nil, &core.ProviderError{Kind: core.ErrInternal, Provider: c.id, Message: err.Error(), Cause: err}
+	}
+	req.Header.Set("Authorization", "Bearer "+jobToken)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := proxyClient(ctx).Do(req)
+	if err != nil {
+		return nil, &core.ProviderError{Kind: core.ErrUpstream, Provider: c.id, Message: "qoder user status: " + err.Error(), Cause: err}
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
+	if resp.StatusCode >= 400 {
+		kind := core.ErrUpstream
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			kind = core.ErrAuth
+		}
+		return nil, &core.ProviderError{Kind: kind, Provider: c.id, StatusCode: resp.StatusCode, Message: "qoder user status failed: " + truncateError(body)}
+	}
+
+	var status qoderUserStatus
+	if err := json.Unmarshal(body, &status); err != nil {
+		return nil, &core.ProviderError{Kind: core.ErrUpstream, Provider: c.id, Message: "qoder user status: parse: " + err.Error(), Cause: err}
+	}
+	if strings.TrimSpace(status.ID) == "" {
+		return nil, &core.ProviderError{Kind: core.ErrAuth, Provider: c.id, Message: "qoder user status returned no user id; check the personal access token"}
+	}
+	return &status, nil
+}
+
+// --- Quota -----------------------------------------------------------------
+
+func init() {
+	// Register an instance for quota lookups. PAT sessions live in the shared
+	// package-level qoderPATCache, so quota fetches reuse the job token minted
+	// by the dispatch connector instead of performing a second exchange.
+	RegisterQuotaSource("qoder", NewQoder("qoder", ""))
+}
+
+// FetchQuota reports the Qoder account's plan and request quota, read from the
+// non-COSY user/status endpoint. Only PAT connections expose a queryable quota;
+// other cases return a plain message (not an error) so the UI degrades cleanly.
+func (c *Qoder) FetchQuota(ctx context.Context, creds core.Credentials) (*QuotaResult, error) {
+	if !qoderIsPAT(creds) {
+		return &QuotaResult{Message: "Qoder quota is only available for Personal Access Token connections."}, nil
+	}
+	if qoderPATToken(creds) == "" {
+		return &QuotaResult{Message: "No personal access token; cannot fetch quota."}, nil
+	}
+	sess, err := c.resolveQoderSession(ctx, qoderPATToken(creds))
+	if err != nil {
+		return nil, err
+	}
+	st, err := c.fetchUserStatus(ctx, sess.jobToken)
+	if err != nil {
+		return nil, err
+	}
+	return qoderQuotaFromStatus(st), nil
+}
+
+// qoderQuotaFromStatus maps a user/status payload into a QuotaResult. Mirrors
+// OmniRoute's parseQoderUserStatusUsage: exhausted quota reports a 0-remaining
+// bar; pooled team/enterprise seats report a shared-pool note; accounts with no
+// per-user counter (trials) report a not-metered note (a limit:0 bar would
+// render as 0%/exhausted in the UI).
+func qoderQuotaFromStatus(st *qoderUserStatus) *QuotaResult {
+	plan := prettifyQoderPlan(st.Plan, st.UserTag)
+	resetAt := qoderResetAt(st.NextResetAt)
+	userType := strings.ToLower(strings.TrimSpace(st.UserType))
+	pooled := userType == "teams" || userType == "enterprise"
+	quota := int(st.Quota)
+
+	result := &QuotaResult{PlanName: plan}
+	switch {
+	case st.IsQuotaExceeded:
+		result.Quotas = append(result.Quotas, QuotaEntry{
+			ResourceType: "requests",
+			Used:         quota,
+			Limit:        quota,
+			Remaining:    0,
+			ResetAt:      resetAt,
+			PlanName:     plan,
+		})
+		result.Message = "Quota exceeded."
+	case pooled:
+		result.Message = plan + " plan · shared team pool"
+	case quota <= 0:
+		// Trial / individual plans that Qoder does not meter with a per-user
+		// counter report quota:0 while isQuotaExceeded stays false. There is no
+		// remaining-credit number to show, so name the plan and say so plainly.
+		result.Message = plan + " plan · usage not metered by Qoder"
+	default:
+		result.Quotas = append(result.Quotas, QuotaEntry{
+			ResourceType: "requests",
+			Used:         0,
+			Limit:        quota,
+			Remaining:    quota,
+			ResetAt:      resetAt,
+			PlanName:     plan,
+		})
+	}
+	return result
+}
+
+// prettifyQoderPlan turns Qoder's PLAN_TIER_* enum / userTag into a label.
+// The userTag (e.g. "Pro Trial") is preferred when present.
+func prettifyQoderPlan(plan, userTag string) string {
+	if tag := strings.TrimSpace(userTag); tag != "" {
+		return tag
+	}
+	stripped := strings.TrimSpace(plan)
+	if len(stripped) >= len("PLAN_TIER_") && strings.EqualFold(stripped[:len("PLAN_TIER_")], "PLAN_TIER_") {
+		stripped = stripped[len("PLAN_TIER_"):]
+	}
+	if stripped == "" {
+		return "Qoder"
+	}
+	words := strings.FieldsFunc(stripped, func(r rune) bool { return r == '_' || r == ' ' })
+	for i, w := range words {
+		if w == "" {
+			continue
+		}
+		words[i] = strings.ToUpper(w[:1]) + strings.ToLower(w[1:])
+	}
+	return strings.Join(words, " ")
+}
+
+// qoderResetAt renders the epoch-millisecond reset time as RFC3339 (empty when
+// unset). RFC3339 is understood by both the account quota bar and the quota
+// page's countdown formatter; a bare millisecond string would not parse.
+func qoderResetAt(nextResetAt int64) string {
+	if nextResetAt <= 0 {
+		return ""
+	}
+	return time.UnixMilli(nextResetAt).UTC().Format(time.RFC3339)
+}
+
+// exchangeJobToken POSTs the PAT to Qoder's job-token exchange and returns the
+// jt-* job token plus its lifetime. A raw PAT cannot sign COSY directly; this
+// mirrors qodercli's headless exchange step.
+func (c *Qoder) exchangeJobToken(ctx context.Context, pat string) (string, time.Duration, error) {
+	reqBody, err := json.Marshal(map[string]string{"personal_token": pat})
+	if err != nil {
+		return "", 0, &core.ProviderError{Kind: core.ErrInternal, Provider: c.id, Message: err.Error(), Cause: err}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, qoderlib.JobTokenExchangeURL, bytes.NewReader(reqBody))
+	if err != nil {
+		return "", 0, &core.ProviderError{Kind: core.ErrInternal, Provider: c.id, Message: err.Error(), Cause: err}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := proxyClient(ctx).Do(req)
+	if err != nil {
+		return "", 0, &core.ProviderError{Kind: core.ErrUpstream, Provider: c.id, Message: "qoder job token exchange: " + err.Error(), Cause: err}
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
+	if resp.StatusCode >= 400 {
+		kind := core.ErrUpstream
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			kind = core.ErrAuth
+		}
+		return "", 0, &core.ProviderError{Kind: kind, Provider: c.id, StatusCode: resp.StatusCode, Message: "qoder job token exchange failed: " + truncateError(body)}
+	}
+
+	token, ttl := parseQoderJobToken(body)
+	if token == "" {
+		return "", 0, &core.ProviderError{Kind: core.ErrAuth, Provider: c.id, Message: "qoder job token exchange returned no job token; check the personal access token"}
+	}
+	return token, ttl, nil
+}
+
+// parseQoderJobToken extracts the jt-* job token and its lifetime from the
+// (loosely-specified) exchange response. The token appears under "token" (or
+// job_token/jobToken/jt) at the root or under a data object. Expiry is taken
+// from the RFC3339 expires_at when present; the numeric expires_in is reported
+// in milliseconds. Defaults to ~24h and is clamped to a sane minimum.
+func parseQoderJobToken(body []byte) (string, time.Duration) {
+	type jobTokenFields struct {
+		JobToken     string  `json:"job_token"`
+		JobTokenCaml string  `json:"jobToken"`
+		JT           string  `json:"jt"`
+		Token        string  `json:"token"`
+		ExpiresAt    string  `json:"expires_at"`
+		ExpiresIn    float64 `json:"expires_in"`
+		ExpiresInCml float64 `json:"expiresIn"`
+	}
+	var root struct {
+		jobTokenFields
+		Data jobTokenFields `json:"data"`
+	}
+	if json.Unmarshal(body, &root) != nil {
+		return "", 0
+	}
+	candidates := []string{
+		root.JobToken, root.JobTokenCaml, root.JT, root.Token,
+		root.Data.JobToken, root.Data.JobTokenCaml, root.Data.JT, root.Data.Token,
+	}
+	var token string
+	for _, cand := range candidates {
+		if trimmed := strings.TrimSpace(cand); strings.HasPrefix(trimmed, "jt-") {
+			token = trimmed
+			break
+		}
+	}
+	if token == "" {
+		return "", 0
+	}
+
+	ttl := qoderJobTokenDefaultTTL
+	derived := false
+	// Prefer the absolute expiry timestamp; refresh a little before it lapses.
+	for _, ts := range []string{root.ExpiresAt, root.Data.ExpiresAt} {
+		if t, err := time.Parse(time.RFC3339, strings.TrimSpace(ts)); err == nil {
+			if d := time.Until(t); d > 0 {
+				ttl = d
+				derived = true
+			}
+			break
+		}
+	}
+	// Fall back to the numeric expires_in (milliseconds).
+	if !derived {
+		for _, ms := range []float64{root.ExpiresIn, root.ExpiresInCml, root.Data.ExpiresIn, root.Data.ExpiresInCml} {
+			if ms > 0 {
+				ttl = time.Duration(ms) * time.Millisecond
+				derived = true
+				break
+			}
+		}
+	}
+	// Refresh slightly early so a signed request never uses a just-expired
+	// token. Only skew a server-reported lifetime, never the static default.
+	if derived && ttl > qoderJobTokenRefreshSkew {
+		ttl -= qoderJobTokenRefreshSkew
+	}
+	if ttl < qoderJobTokenMinTTL {
+		ttl = qoderJobTokenMinTTL
+	}
+	return token, ttl
 }
 
 // --- Request body building --------------------------------------------------
@@ -508,8 +916,7 @@ func (c *Qoder) buildPayload(req *core.ChatRequest, modelKey string, modelConfig
 // fetchModelCatalog fetches the live model list from api3.qoder.sh and caches
 // the raw model_config blocks by key. This is required because Qoder silently
 // downgrades to a different model when the wrong model_config is sent.
-func (c *Qoder) fetchModelCatalog(ctx context.Context, creds core.Credentials) (map[string]json.RawMessage, error) {
-	cc := c.cosyCreds(creds)
+func (c *Qoder) fetchModelCatalog(ctx context.Context, cc qoderlib.CosyCreds) (map[string]json.RawMessage, error) {
 	cacheKey := cc.UserID
 
 	// Check cache first.
@@ -578,8 +985,8 @@ func (c *Qoder) fetchModelCatalog(ctx context.Context, creds core.Credentials) (
 
 // modelConfigForKey resolves the model_config block for a given model key,
 // fetching the catalog if needed.
-func (c *Qoder) modelConfigForKey(ctx context.Context, creds core.Credentials, modelKey string) (json.RawMessage, error) {
-	configs, err := c.fetchModelCatalog(ctx, creds)
+func (c *Qoder) modelConfigForKey(ctx context.Context, cc qoderlib.CosyCreds, modelKey string) (json.RawMessage, error) {
+	configs, err := c.fetchModelCatalog(ctx, cc)
 	if err != nil {
 		return nil, err
 	}
@@ -594,8 +1001,7 @@ func (c *Qoder) modelConfigForKey(ctx context.Context, creds core.Credentials, m
 
 // signedRequest builds the COSY-signed, WAF-encoded request for the Qoder chat
 // endpoint. Returns the URL, headers, and encoded body ready for sending.
-func (c *Qoder) signedRequest(payload qoderPayload, creds core.Credentials) (url string, headers map[string]string, body []byte, err error) {
-	cc := c.cosyCreds(creds)
+func (c *Qoder) signedRequest(payload qoderPayload, cc qoderlib.CosyCreds) (url string, headers map[string]string, body []byte, err error) {
 	url = qoderlib.ChatURLEncoded
 
 	plainBody, err := json.Marshal(payload)
@@ -632,17 +1038,22 @@ func (c *Qoder) Stream(ctx context.Context, req *core.ChatRequest, creds core.Cr
 		return nil, err
 	}
 
+	cc, err := c.resolveCosyCreds(ctx, creds)
+	if err != nil {
+		return nil, err
+	}
+
 	modelKey := resolveModelKey(req.Model)
-	modelConfig, err := c.modelConfigForKey(ctx, creds, modelKey)
+	modelConfig, err := c.modelConfigForKey(ctx, cc, modelKey)
 	if err != nil {
 		// Non-fatal: use a minimal model_config and let upstream decide.
 		modelConfig = nil
 	}
 
-	payload := c.buildPayload(req, modelKey, modelConfig, c.cosyCreds(creds).UserID)
+	payload := c.buildPayload(req, modelKey, modelConfig, cc.UserID)
 	payload.Stream = true
 
-	url, headers, body, err := c.signedRequest(payload, creds)
+	url, headers, body, err := c.signedRequest(payload, cc)
 	if err != nil {
 		return nil, &core.ProviderError{Kind: core.ErrInternal, Provider: c.id, Model: req.Model, Message: err.Error(), Cause: err}
 	}
@@ -799,8 +1210,11 @@ func (c *Qoder) Validate(ctx context.Context, creds core.Credentials) error {
 	if err := c.validateCreds(creds); err != nil {
 		return err
 	}
-	_, err := c.fetchModelCatalog(ctx, creds)
+	cc, err := c.resolveCosyCreds(ctx, creds)
 	if err != nil {
+		return fmt.Errorf("validation failed for %s: %w", c.id, err)
+	}
+	if _, err := c.fetchModelCatalog(ctx, cc); err != nil {
 		return fmt.Errorf("validation failed for %s: %w", c.id, err)
 	}
 	return nil
@@ -873,7 +1287,12 @@ func (c *Qoder) ListModels(ctx context.Context, creds core.Credentials) ([]Model
 		return nil, err
 	}
 
-	configs, err := c.fetchModelCatalog(ctx, creds)
+	cc, err := c.resolveCosyCreds(ctx, creds)
+	if err != nil {
+		return nil, err
+	}
+
+	configs, err := c.fetchModelCatalog(ctx, cc)
 	if err != nil {
 		return nil, err
 	}

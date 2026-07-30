@@ -352,12 +352,33 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, codec transf
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
+	// Heartbeats keep intermediate proxies from dropping the client connection
+	// as idle while the upstream model is silent (long thinking phases produce
+	// no SSE output). NDJSON has no comment syntax, so Ollama clients are
+	// exempt.
+	heartbeatInterval := s.cfg.Server.StreamHeartbeatInterval
+	if req.Metadata.SourceDialect == core.DialectOllama {
+		heartbeatInterval = 0
+	}
+
 	// Direct stream path: frame SSE events without decoding normal payloads. This
 	// preserves the low-overhead path while replacing late in-band provider
 	// errors before they can reach the client.
 	if result.DirectBody != nil {
 		defer result.DirectBody.Close()
-		n, cpErr := copySanitizedStream(w, result.DirectBody, req.Metadata.SourceDialect, flusher.Flush)
+		dst := io.Writer(w)
+		frameFlush := flusher.Flush
+		var hw *heartbeatWriter
+		if heartbeatInterval > 0 {
+			hw = newHeartbeatWriter(w, flusher.Flush, heartbeatInterval)
+			defer hw.stop()
+			dst = hw
+			frameFlush = nil // the heartbeat writer flushes after every frame
+		}
+		n, cpErr := copySanitizedStream(dst, result.DirectBody, req.Metadata.SourceDialect, frameFlush)
+		if hw != nil {
+			hw.stop()
+		}
 		if cpErr != nil && !isClientDisconnect(cpErr) {
 			s.consoleLog.Log("ERROR", fmt.Sprintf("Stream interrupted after %s", humanBytes(int(n))), cpErr.Error())
 			s.log.Warn("direct stream error", "bytes", n, "err", cpErr)
@@ -455,32 +476,64 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, codec transf
 		flusher.Flush()
 	}
 
+	var heartbeatC <-chan time.Time
+	if heartbeatInterval > 0 {
+		heartbeatTicker := time.NewTicker(heartbeatInterval)
+		defer heartbeatTicker.Stop()
+		heartbeatC = heartbeatTicker.C
+	}
+	lastActivity := time.Now()
+
 	var streamErr error
-	for chunk := range result.Chunks {
-		if chunk.Type == core.ChunkError {
-			streamErr = chunk.Err
-			if streamErr == nil {
-				streamErr = &core.ProviderError{Kind: core.ErrUpstream, Message: "provider stream failed"}
+streamLoop:
+	for {
+		select {
+		case chunk, ok := <-result.Chunks:
+			if !ok {
+				break streamLoop
 			}
-			s.consoleLog.Log("ERROR", "Provider stream error", fmt.Sprintf("%v", streamErr))
-			s.log.Warn("stream error", "err", streamErr)
-			_, _ = bw.Write(streamErrorEvent(req.Metadata.SourceDialect, sanitizeUpstreamError(streamErr)))
-			// Emit terminal events so strict clients (Claude Code, Cline) see a
-			// well-formed stream end instead of a truncated connection. Without
-			// message_stop/[DONE], the client may treat the stream as incomplete
-			// and retry the request — causing duplicate responses on the user side.
-			for _, ev := range streamCodec.RenderStreamDone(state) {
-				_, _ = bw.Write(ev)
+			lastActivity = time.Now()
+			if chunk.Type == core.ChunkError {
+				streamErr = chunk.Err
+				if streamErr == nil {
+					streamErr = &core.ProviderError{Kind: core.ErrUpstream, Message: "provider stream failed"}
+				}
+				s.consoleLog.Log("ERROR", "Provider stream error", fmt.Sprintf("%v", streamErr))
+				s.log.Warn("stream error", "err", streamErr)
+				_, _ = bw.Write(streamErrorEvent(req.Metadata.SourceDialect, sanitizeUpstreamError(streamErr)))
+				// Emit terminal events so strict clients (Claude Code, Cline) see a
+				// well-formed stream end instead of a truncated connection. Without
+				// message_stop/[DONE], the client may treat the stream as incomplete
+				// and retry the request — causing duplicate responses on the user side.
+				for _, ev := range streamCodec.RenderStreamDone(state) {
+					_, _ = bw.Write(ev)
+				}
+				_ = bw.Flush()
+				flusher.Flush()
+				break streamLoop
 			}
-			_ = bw.Flush()
+			if chunk.Type == core.ChunkUsage && chunk.Usage != nil {
+				totalTokens = chunk.Usage.PromptTokens + chunk.Usage.CompletionTokens
+			}
+			chunkCount++
+			sanitizer.Process(chunk, renderChunk)
+		case <-heartbeatC:
+			// Only beat when the stream has actually been silent; steady chunk
+			// traffic is its own keep-alive.
+			if time.Since(lastActivity) < heartbeatInterval {
+				continue
+			}
+			if _, werr := bw.Write(sseHeartbeatFrame); werr != nil {
+				streamErr = &streamWriteError{err: werr}
+				break streamLoop
+			}
+			if werr := bw.Flush(); werr != nil {
+				streamErr = &streamWriteError{err: werr}
+				break streamLoop
+			}
 			flusher.Flush()
-			break
+			lastActivity = time.Now()
 		}
-		if chunk.Type == core.ChunkUsage && chunk.Usage != nil {
-			totalTokens = chunk.Usage.PromptTokens + chunk.Usage.CompletionTokens
-		}
-		chunkCount++
-		sanitizer.Process(chunk, renderChunk)
 	}
 
 	latency := int(time.Since(streamStart).Milliseconds())

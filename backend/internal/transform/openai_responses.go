@@ -17,7 +17,13 @@ import (
 // ({type,name,description,parameters}), and the streaming surface is a rich
 // event sequence (response.created → output_item.added → output_text.delta →
 // ... → response.completed) rather than uniform chat.completion.chunk deltas.
-type OpenAIResponsesCodec struct{}
+type OpenAIResponsesCodec struct {
+	// Codex tailors the rendered request to the ChatGPT Codex backend
+	// (reasoning summary, encrypted-content include, default instructions).
+	// It is set by the codex connector; the zero value renders the plain
+	// OpenAI Responses API shape.
+	Codex bool
+}
 
 func (OpenAIResponsesCodec) Dialect() core.Dialect { return core.DialectOpenAIResponses }
 
@@ -47,6 +53,11 @@ type respRequest struct {
 	Temperature *float64 `json:"temperature,omitempty"`
 	MaxTokens   *int     `json:"max_tokens,omitempty"`
 	TopP        *float64 `json:"top_p,omitempty"`
+	// Reasoning carries the Responses-native effort knob so codex CLI style
+	// clients keep their requested effort through the canonical model.
+	Reasoning *struct {
+		Effort string `json:"effort,omitempty"`
+	} `json:"reasoning,omitempty"`
 }
 
 // responsesAPIAllowlist enumerates the fields that the Responses API (/v1/responses)
@@ -118,6 +129,9 @@ func (OpenAIResponsesCodec) ParseRequest(body []byte) (*core.ChatRequest, error)
 	req.Temperature = raw.Temperature
 	req.MaxTokens = raw.MaxTokens
 	req.TopP = raw.TopP
+	if raw.Reasoning != nil && raw.Reasoning.Effort != "" {
+		req.Reasoning = &core.ReasoningConfig{Effort: raw.Reasoning.Effort}
+	}
 
 	for _, t := range raw.Tools {
 		name := t.Name
@@ -317,7 +331,7 @@ func rawToString(raw json.RawMessage) string {
 
 // ---- request rendering (outbound to Codex/Responses provider) ---------------
 
-func (OpenAIResponsesCodec) RenderRequest(req *core.ChatRequest) ([]byte, error) {
+func (c OpenAIResponsesCodec) RenderRequest(req *core.ChatRequest) ([]byte, error) {
 	// Catalog aliases like grok-4.5-high / gpt-5.3-codex-high are not real
 	// upstream model IDs. Strip the effort suffix and emit reasoning.effort
 	// instead. Explicit req.Reasoning.Effort wins over the suffix value.
@@ -332,12 +346,38 @@ func (OpenAIResponsesCodec) RenderRequest(req *core.ChatRequest) ([]byte, error)
 		"stream": req.Stream,
 		"store":  false,
 	}
-	if req.System != "" {
+	switch {
+	case req.System != "":
 		out["instructions"] = req.System
-	} else {
+	case c.Codex:
+		// The Codex backend expects non-empty instructions; a neutral default
+		// keeps bare chat requests working (mirrors the codex CLI).
+		out["instructions"] = "You are a ChatGPT agent."
+	default:
 		out["instructions"] = ""
 	}
-	if isResponsesReasoningEffortEnabled(effort) {
+	// Reasoning effort where the client, the catalog suffix, or the codex
+	// connector requested it. "Model decides" values (auto/adaptive — e.g.
+	// Claude Code's adaptive thinking) have no Responses API wire value and
+	// cause 400 invalid_value upstream, so they are omitted rather than
+	// forwarded. The codex connector normalizes efforts before rendering, so
+	// that guard only fires for non-codex Responses providers.
+	effort = strings.ToLower(effort)
+	if effort == "auto" || effort == "adaptive" || effort == "default" {
+		effort = ""
+	}
+	switch {
+	case c.Codex && effort != "":
+		// Codex accepts "none" as a wire value; the other efforts also stream
+		// reasoning summaries and need the encrypted reasoning content echoed
+		// back on follow-up turns (store=false).
+		reasoning := map[string]any{"effort": effort}
+		if effort != "none" {
+			reasoning["summary"] = "auto"
+			out["include"] = []string{"reasoning.encrypted_content"}
+		}
+		out["reasoning"] = reasoning
+	case isResponsesReasoningEffortEnabled(effort):
 		out["reasoning"] = map[string]any{"effort": effort}
 	}
 	// NOTE: temperature, max_tokens, top_p are intentionally NOT included.

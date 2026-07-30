@@ -640,8 +640,9 @@ func (s *Server) adminListAccounts(w http.ResponseWriter, r *http.Request) {
 			"id": a.ID, "provider": a.Provider, "label": a.Label,
 			"auth_kind": a.AuthKind, "priority": a.Priority,
 			"disabled": a.Disabled, "proxy_pool_id": a.ProxyPoolID,
-			"needs_reconnect": a.NeedsReconnect,
-			"created_at":      a.CreatedAt,
+			"needs_reconnect":   a.NeedsReconnect,
+			"credits_exhausted": a.CreditsExhausted,
+			"created_at":        a.CreatedAt,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
@@ -3135,6 +3136,12 @@ func providerAccountMetadata(spec connectors.ProviderSpec, in providerMetadataIn
 		}
 		// OpenAICompatible resolves {accountId} placeholders from Extra.
 		meta["accountId"] = accountID
+	case "qoder":
+		// API-key connections to Qoder use a Personal Access Token (pt-*),
+		// which the connector exchanges for a short-lived COSY job token. Mark
+		// the auth method and mint a stable machine id for the COSY envelope.
+		meta["qoder_auth_method"] = "pat"
+		meta["machine_id"] = uuid.NewString()
 	case "azure":
 		endpoint := strings.TrimRight(strings.TrimSpace(in.AzureEndpoint), "/")
 		deployment := strings.TrimSpace(in.AzureDeployment)

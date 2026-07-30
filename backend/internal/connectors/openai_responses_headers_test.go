@@ -44,11 +44,15 @@ func TestOpenAIResponsesCodexHeadersUnaffected(t *testing.T) {
 
 	headers := c.headers(core.Credentials{AccessToken: "tok_test"})
 
+	// grok-cli identity headers must never leak onto codex requests.
 	require.Equal(t, "Bearer tok_test", headers["Authorization"])
 	require.Empty(t, headers["x-grok-client-version"])
 	require.Empty(t, headers["x-grok-client-identifier"])
 	require.Empty(t, headers["X-XAI-Token-Auth"])
 	require.Empty(t, headers["x-authenticateresponse"])
 	require.Empty(t, headers["x-grok-client-mode"])
-	require.Empty(t, headers["User-Agent"])
+
+	// codex carries its own CLI identity headers instead (not the grok ones).
+	require.Equal(t, "codex_cli_rs/"+codexClientVersion, headers["User-Agent"])
+	require.Equal(t, "codex_cli_rs", headers["originator"])
 }

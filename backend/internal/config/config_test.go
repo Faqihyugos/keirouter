@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 func TestLoadAllowPrivateBaseURLFromEnv(t *testing.T) {
@@ -34,6 +35,35 @@ func TestLoadAllowPrivateBaseURLFromEnv(t *testing.T) {
 				t.Fatalf("AllowPrivateBaseURL = false, want true")
 			}
 		})
+	}
+}
+
+func TestStreamHeartbeatIntervalConfig(t *testing.T) {
+	if got := Default().Server.StreamHeartbeatInterval; got != 15*time.Second {
+		t.Fatalf("default StreamHeartbeatInterval = %v, want 15s", got)
+	}
+
+	path := t.TempDir() + "/config.yaml"
+	if err := os.WriteFile(path, []byte("server:\n  stream_heartbeat_interval: 9s\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if got := cfg.Server.StreamHeartbeatInterval; got != 9*time.Second {
+		t.Fatalf("StreamHeartbeatInterval = %v, want 9s", got)
+	}
+}
+
+func TestStreamHeartbeatIntervalFromEnv(t *testing.T) {
+	t.Setenv("KEIROUTER_SERVER__STREAM_HEARTBEAT_INTERVAL", "7s")
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if got := cfg.Server.StreamHeartbeatInterval; got != 7*time.Second {
+		t.Fatalf("StreamHeartbeatInterval = %v, want 7s", got)
 	}
 }
 

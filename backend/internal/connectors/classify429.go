@@ -31,6 +31,37 @@ var quotaPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)daily free allocation`),
 }
 
+// creditsPatterns matches provider error text indicating the account's paid
+// balance is depleted. Unlike calendar quotas these never recover on their
+// own — the user must top up or renew — so they warrant parking the account
+// rather than scheduling a quota-window cooldown.
+var creditsPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)insufficient[ _]?(?:credit|balance|fund)`),
+	regexp.MustCompile(`(?i)insufficient[ _]?quota`),
+	regexp.MustCompile(`(?i)out of credits`),
+	regexp.MustCompile(`(?i)no credits? remaining`),
+	regexp.MustCompile(`(?i)credit.{0,40}(?:exhaust|too low|deplet)`),
+	regexp.MustCompile(`(?i)balance.{0,40}(?:too low|insufficient|exhaust|deplet)`),
+	regexp.MustCompile(`(?i)(?:purchase|buy|add).{0,20}credits`),
+	regexp.MustCompile(`(?i)\btop[- ]?up\b`),
+	regexp.MustCompile(`(?i)payment required`),
+}
+
+// looksLikeCreditsExhausted reports whether the provider error body indicates
+// a depleted paid balance rather than a resettable quota or transient rate
+// limit. Used to classify errors into a terminal credits-exhausted state.
+func looksLikeCreditsExhausted(body string) bool {
+	if body == "" {
+		return false
+	}
+	for _, re := range creditsPatterns {
+		if re.MatchString(body) {
+			return true
+		}
+	}
+	return false
+}
+
 // rateLimitPatterns matches transient rate-limit text. These are short-term
 // backoffs, not long-term quota exhaustion.
 var rateLimitPatterns = []*regexp.Regexp{
@@ -212,10 +243,10 @@ func positiveDuration(at time.Time) time.Duration {
 	return 0
 }
 
-// classify429 determines whether a 429 response is a transient rate limit or
-// a hard quota exhaustion, and extracts any upstream-provided retry hint.
-// Returns (kind, retryAfter).
-func classify429(resp *http.Response, body []byte) (kind core.ErrorKind, retryAfter time.Duration) {
+// classify429 determines whether a 429 response is a transient rate limit, a
+// hard quota exhaustion, or a depleted paid balance, and extracts any
+// upstream-provided retry hint. Returns (kind, retryAfter, creditsExhausted).
+func classify429(resp *http.Response, body []byte) (kind core.ErrorKind, retryAfter time.Duration, creditsExhausted bool) {
 	// Extract retry hints from headers first.
 	retryAfter = parseResetFromHeaders(resp)
 	if retryAfter <= 0 {
@@ -223,14 +254,21 @@ func classify429(resp *http.Response, body []byte) (kind core.ErrorKind, retryAf
 	}
 
 	bodyStr := string(body)
-	// Hard quota exhaustion takes precedence: long cooldown, no point retrying
-	// before the calendar/quota window rolls over.
+	// A depleted balance takes precedence over everything: it never recovers
+	// on its own, so the dispatcher parks the account instead of scheduling a
+	// quota-window cooldown.
+	if looksLikeCreditsExhausted(bodyStr) {
+		return core.ErrQuotaExhausted, retryAfter, true
+	}
+
+	// Hard quota exhaustion next: long cooldown, no point retrying before the
+	// calendar/quota window rolls over.
 	if looksLikeQuotaExhausted(bodyStr) {
 		// If no explicit retry hint, use a conservative long default.
 		if retryAfter <= 0 {
 			retryAfter = 30 * time.Minute
 		}
-		return core.ErrQuotaExhausted, retryAfter
+		return core.ErrQuotaExhausted, retryAfter, false
 	}
 
 	// Transient rate limit: short exponential backoff. If no header hint,
@@ -238,5 +276,5 @@ func classify429(resp *http.Response, body []byte) (kind core.ErrorKind, retryAf
 	if retryAfter <= 0 {
 		retryAfter = 5 * time.Second
 	}
-	return core.ErrRateLimit, retryAfter
+	return core.ErrRateLimit, retryAfter, false
 }

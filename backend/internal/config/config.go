@@ -38,6 +38,11 @@ type ServerConfig struct {
 	Port int    `koanf:"port"`
 	// StreamStallTimeout aborts a stream that produces no bytes for this long.
 	StreamStallTimeout time.Duration `koanf:"stream_stall_timeout"`
+	// StreamHeartbeatInterval emits an SSE comment on client streams that have
+	// been silent for this long, so reverse proxies and load balancers between
+	// KeiRouter and the client do not drop the connection as idle while the
+	// upstream model is thinking. Zero disables heartbeats.
+	StreamHeartbeatInterval time.Duration `koanf:"stream_heartbeat_interval"`
 	// RequestTimeout bounds non-streaming upstream calls.
 	RequestTimeout time.Duration `koanf:"request_timeout"`
 	// CORSOrigins lists allowed dashboard origins ("*" permitted for local).
@@ -258,8 +263,11 @@ func Default() Config {
 			// 60s prevents premature stall timeouts for codex/Responses
 			// streams which may have longer thinking periods between chunks.
 			StreamStallTimeout: 60 * time.Second,
-			RequestTimeout:     5 * time.Minute,
-			CORSOrigins:        []string{"*"},
+			// 15s keeps connections alive through common proxy idle timeouts
+			// (nginx defaults to 60s) without meaningful bandwidth cost.
+			StreamHeartbeatInterval: 15 * time.Second,
+			RequestTimeout:          5 * time.Minute,
+			CORSOrigins:             []string{"*"},
 		},
 		Database: DatabaseConfig{
 			Driver:          "sqlite",

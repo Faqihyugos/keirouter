@@ -1,20 +1,24 @@
 import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { ExternalLink, RefreshCw, CheckCircle2, X, AlertTriangle } from "lucide-react";
+import { ExternalLink, RefreshCw, CheckCircle2, X, AlertTriangle, KeyRound, ChevronLeft } from "lucide-react";
 import { api, type DeviceCode } from "../lib/api";
-import { Button, ErrorBanner } from "./ui";
+import { Button, ErrorBanner, Field, Input } from "./ui";
 import { useToast } from "./Toast";
 
-// QoderConnectModal implements the Qoder PKCE device-token flow:
-//   1. Backend generates PKCE pair + nonce + machine_id.
-//   2. We open https://qoder.com/device/selectAccounts?challenge=... in the browser.
-//   3. We poll openapi.qoder.sh until the user authorizes and we get a token.
+// QoderConnectModal offers two ways to connect a Qoder account:
+//   1. OAuth PKCE device-token flow (sign in with your Qoder account).
+//   2. Personal Access Token (PAT, pt-*) — pasted from qoder.com/account/
+//      integrations. The backend exchanges the PAT for a short-lived COSY job
+//      token on each request, so no browser round-trip is needed.
 //
-// The flow mirrors Kiro's device-code UX but is simpler — no method picker,
-// no user code to type. The user just picks their Qoder account in the popup.
+// The OAuth flow mirrors Kiro's device-code UX; the method picker mirrors
+// Kiro's multi-method connect modal.
+type QoderMethod = "oauth" | "pat";
+
 export function QoderConnectModal({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient();
   const toast = useToast();
+  const [method, setMethod] = useState<QoderMethod | null>(null);
   const [dc, setDc] = useState<DeviceCode | null>(null);
   const [status, setStatus] = useState<"idle" | "starting" | "waiting" | "done" | "error">("idle");
   const [error, setError] = useState("");
@@ -127,32 +131,159 @@ export function QoderConnectModal({ onClose }: { onClose: () => void }) {
 
         {/* Body */}
         <div className="px-6 py-5">
-          {status === "idle" && <IdleState onStart={start} />}
+          {method === null && <MethodSelect onSelect={setMethod} />}
 
-          {status === "starting" && <StartingState />}
+          {method === "oauth" && (
+            <>
+              {status === "idle" && <IdleState onStart={start} onBack={() => setMethod(null)} />}
 
-          {status === "waiting" && dc && (
-            <WaitingState
-              dc={dc}
-              elapsed={elapsed}
-              formatElapsed={formatElapsed}
-            />
+              {status === "starting" && <StartingState />}
+
+              {status === "waiting" && dc && (
+                <WaitingState
+                  dc={dc}
+                  elapsed={elapsed}
+                  formatElapsed={formatElapsed}
+                />
+              )}
+
+              {status === "done" && <DoneState />}
+
+              {status === "error" && (
+                <ErrorState error={error} onRetry={start} onClose={onClose} />
+              )}
+            </>
           )}
 
-          {status === "done" && <DoneState />}
-
-          {status === "error" && (
-            <ErrorState error={error} onRetry={start} onClose={onClose} />
-          )}
+          {method === "pat" && <PATFlow onClose={onClose} onBack={() => setMethod(null)} />}
         </div>
       </div>
     </div>
   );
 }
 
-function IdleState({ onStart }: { onStart: () => void }) {
+function MethodSelect({ onSelect }: { onSelect: (m: QoderMethod) => void }) {
+  return (
+    <div className="space-y-3">
+      <p className="text-sm text-[var(--text-muted)]">Choose how to connect your Qoder account:</p>
+
+      <button
+        onClick={() => onSelect("oauth")}
+        className="flex w-full items-start gap-3 rounded-xl border border-[var(--border)] bg-[var(--bg-subtle)] p-4 text-left transition-colors hover:border-accent-400 hover:bg-ink-100 dark:hover:bg-ink-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-400/60"
+      >
+        <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-accent-100 text-accent-700 dark:bg-accent-800/40 dark:text-accent-200">
+          <ExternalLink className="h-4 w-4" />
+        </span>
+        <span>
+          <span className="block text-sm font-medium text-[var(--text)]">Sign in with Qoder</span>
+          <span className="block text-xs text-[var(--text-muted)]">Authorize in your browser — no key to copy.</span>
+        </span>
+      </button>
+
+      <button
+        onClick={() => onSelect("pat")}
+        className="flex w-full items-start gap-3 rounded-xl border border-[var(--border)] bg-[var(--bg-subtle)] p-4 text-left transition-colors hover:border-accent-400 hover:bg-ink-100 dark:hover:bg-ink-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-400/60"
+      >
+        <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-accent-100 text-accent-700 dark:bg-accent-800/40 dark:text-accent-200">
+          <KeyRound className="h-4 w-4" />
+        </span>
+        <span>
+          <span className="block text-sm font-medium text-[var(--text)]">Personal Access Token</span>
+          <span className="block text-xs text-[var(--text-muted)]">Paste a pt-… token from your Qoder integrations page.</span>
+        </span>
+      </button>
+    </div>
+  );
+}
+
+function BackLink({ onBack }: { onBack: () => void }) {
+  return (
+    <button
+      onClick={onBack}
+      className="inline-flex items-center gap-1 text-xs font-medium text-[var(--text-muted)] transition-colors hover:text-[var(--text)] focus:outline-none focus-visible:ring-2 focus-visible:ring-accent-400/60 rounded"
+    >
+      <ChevronLeft className="h-3.5 w-3.5" />
+      Back
+    </button>
+  );
+}
+
+function PATFlow({ onClose, onBack }: { onClose: () => void; onBack: () => void }) {
+  const qc = useQueryClient();
+  const toast = useToast();
+  const [token, setToken] = useState("");
+  const [label, setLabel] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [done, setDone] = useState(false);
+
+  const submit = async () => {
+    const pat = token.trim();
+    if (!pat) {
+      setError("Please enter a Personal Access Token");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await api.createAccount({ provider: "qoder", label: label.trim(), api_key: pat });
+      setDone(true);
+      qc.invalidateQueries({ queryKey: ["accounts"] });
+      toast.success("Qoder connected", "Personal Access Token added successfully.");
+      setTimeout(onClose, 1200);
+    } catch (e) {
+      setError((e as Error).message);
+      toast.error("Qoder token validation failed", (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (done) return <DoneState />;
+
+  return (
+    <div className="space-y-4">
+      <BackLink onBack={onBack} />
+      <p className="text-sm text-[var(--text-muted)]">
+        Paste a Personal Access Token from your{" "}
+        <a
+          href="https://qoder.com/account/integrations"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex items-center gap-0.5 font-medium text-accent-600 hover:underline dark:text-accent-300"
+        >
+          Qoder integrations page
+          <ExternalLink className="h-3 w-3" />
+        </a>
+        . It is validated and encrypted before storage.
+      </p>
+      <Field label="Personal Access Token">
+        <Input
+          value={token}
+          onChange={(e) => setToken(e.target.value)}
+          placeholder="pt-…"
+          className="font-mono"
+        />
+      </Field>
+      <Field label="Label (optional)">
+        <Input
+          value={label}
+          onChange={(e) => setLabel(e.target.value)}
+          placeholder="Qoder"
+        />
+      </Field>
+      {error && <ErrorBanner message={error} />}
+      <Button onClick={submit} disabled={busy} className="w-full">
+        {busy ? "Validating…" : "Connect Qoder"}
+      </Button>
+    </div>
+  );
+}
+
+function IdleState({ onStart, onBack }: { onStart: () => void; onBack: () => void }) {
   return (
     <div className="space-y-5">
+      <BackLink onBack={onBack} />
       <p className="text-sm text-[var(--text-muted)]">
         Connect your Qoder account to route requests through Qoder's API.
         No API key needed — you'll sign in with your Qoder account.

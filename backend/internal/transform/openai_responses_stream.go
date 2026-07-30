@@ -3,6 +3,7 @@ package transform
 import (
 	"bytes"
 	"fmt"
+	"strings"
 
 	json "github.com/mydisha/keirouter/backend/internal/fastjson"
 
@@ -131,7 +132,7 @@ func (OpenAIResponsesCodec) ParseStreamLine(line []byte, _ string) ([]core.Strea
 		}
 		return []core.StreamChunk{{
 			Type: core.ChunkError,
-			Err:  &core.ProviderError{Kind: core.ErrUpstream, Message: msg},
+			Err:  classifyRespStreamError(msg),
 		}}, nil
 
 	default:
@@ -139,6 +140,42 @@ func (OpenAIResponsesCodec) ParseStreamLine(line []byte, _ string) ([]core.Strea
 		// output_text.done, reasoning_summary_*: nothing canonical to emit.
 		return nil, nil
 	}
+}
+
+// classifyRespStreamError maps an in-stream error event (HTTP 200 with an
+// error in the SSE body, so no status code) onto the right error kind/scope.
+// Codex reports request-level problems this way — e.g. "Your input exceeds
+// the context window of this model." — and the previous blanket ErrUpstream
+// classification (provider scope) put the account on cooldown and fed the
+// provider circuit breaker on every client retry, eventually locking out all
+// accounts with "all matching candidates are temporarily unavailable".
+func classifyRespStreamError(msg string) *core.ProviderError {
+	m := strings.ToLower(msg)
+	switch {
+	// Rate limits mention token counts too ("Rate limit reached … too many
+	// tokens per min"); match the rate-limit vocabulary first so a TPM limit
+	// is never mistaken for context overflow below and left without cooldown.
+	case strings.Contains(m, "rate limit") || strings.Contains(m, "rate_limit") ||
+		strings.Contains(m, "tokens per min"):
+		return &core.ProviderError{Kind: core.ErrRateLimit, Message: msg}
+	// Context overflow: the request itself is too large. Only the client can
+	// fix it (compact/trim), so scope it to the request — no cooldown, no
+	// fallback, surface the error straight back.
+	case strings.Contains(m, "exceeds the context window"),
+		strings.Contains(m, "context length"),
+		strings.Contains(m, "maximum context"),
+		strings.Contains(m, "input is too long"),
+		strings.Contains(m, "prompt is too long"),
+		strings.Contains(m, "too many tokens"):
+		return &core.ProviderError{Kind: core.ErrBadRequest, Scope: core.FailureScopeRequest, Message: msg}
+	// Unknown/inaccessible model reported in-stream: model-scoped so chains
+	// can fall back, mirroring the HTTP-status classification in connectors.
+	case strings.Contains(m, "model") &&
+		(strings.Contains(m, "not supported") || strings.Contains(m, "not available") ||
+			strings.Contains(m, "not found") || strings.Contains(m, "does not exist")):
+		return &core.ProviderError{Kind: core.ErrModelUnavailable, Scope: core.FailureScopeModel, Message: msg}
+	}
+	return &core.ProviderError{Kind: core.ErrUpstream, Message: msg}
 }
 
 // respStreamState tracks per-stream rendering bookkeeping for the Responses

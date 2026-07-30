@@ -732,7 +732,7 @@ func TestXiaomiMiMo_Chat_RateLimit(t *testing.T) {
 func TestXiaomiMiMo_Chat_BadRequest(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprint(w, `{"error":{"message":"Model not found","type":"invalid_request_error"}}`)
+		fmt.Fprint(w, `{"error":{"message":"Invalid request: messages field is required","type":"invalid_request_error"}}`)
 	}))
 	defer srv.Close()
 
@@ -750,6 +750,32 @@ func TestXiaomiMiMo_Chat_BadRequest(t *testing.T) {
 	pe := core.AsProviderError(err)
 	require.Equal(t, core.ErrBadRequest, pe.Kind)
 	require.False(t, pe.Fallbackable(), "4xx request errors must not trigger fallback")
+}
+
+// TestChat_ModelNotFound400 verifies that a 400 whose body describes an
+// unknown/inaccessible model is classified model-unavailable (model scope) so
+// chains can fall back to the next model/provider instead of hard-failing.
+func TestChat_ModelNotFound400(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"detail":"The 'gpt-5-6' model is not supported when using Codex with a ChatGPT account."}`)
+	}))
+	defer srv.Close()
+
+	c := NewOpenAICompatible("xiaomi-mimo", srv.URL)
+	req := &core.ChatRequest{
+		Model:  "nonexistent-model",
+		Stream: false,
+		Messages: []core.Message{
+			{Role: core.RoleUser, Content: []core.ContentPart{{Type: core.PartText, Text: "hi"}}},
+		},
+	}
+	_, err := c.Chat(context.Background(), req, core.Credentials{APIKey: "test-key"})
+	require.Error(t, err)
+
+	pe := core.AsProviderError(err)
+	require.Equal(t, core.ErrModelUnavailable, pe.Kind)
+	require.Equal(t, core.FailureScopeModel, pe.EffectiveScope())
 }
 
 func TestXiaomiMiMo_Validate(t *testing.T) {

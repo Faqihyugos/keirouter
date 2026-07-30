@@ -58,7 +58,9 @@ var providerModels = map[string][]ModelSpec{
 		k("dall-e-2", "DALL-E 2", core.ServiceImage),
 	},
 	"codex": {
-		m("gpt-5.5", "GPT-5.5"), m("gpt-5.4", "GPT-5.4"), m("gpt-5.2", "GPT-5.2"), m("gpt-5.1", "GPT-5.1"),
+		m("gpt-5.6-sol", "GPT-5.6 Sol"), m("gpt-5.6-terra", "GPT-5.6 Terra"), m("gpt-5.6-luna", "GPT-5.6 Luna"),
+		m("gpt-5.5", "GPT-5.5"), m("gpt-5.4", "GPT-5.4"), m("gpt-5.4-mini", "GPT-5.4 Mini"),
+		m("gpt-5.2", "GPT-5.2"), m("gpt-5.1", "GPT-5.1"),
 		m("gpt-5.3-codex", "GPT-5.3 Codex"), m("gpt-5.3-codex-xhigh", "GPT-5.3 Codex (xHigh)"),
 		m("gpt-5.3-codex-high", "GPT-5.3 Codex (High)"), m("gpt-5.3-codex-low", "GPT-5.3 Codex (Low)"),
 		m("gpt-5.3-codex-none", "GPT-5.3 Codex (None)"), m("gpt-5.3-codex-spark", "GPT-5.3 Codex (Spark)"),

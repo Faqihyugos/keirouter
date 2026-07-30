@@ -454,7 +454,10 @@ export function ProviderDetailPage() {
   // for Azure (each key needs its own endpoint + deployment, so there is no
   // shared config to bulk against) and for no-auth providers (nothing to bulk).
   const providerSupportsApiKey = provider.auth_modes.includes("api_key") || provider.auth_kind === "api_key";
-  const supportsBulkUpload = supportsManualConnect && providerSupportsApiKey && provider.id !== "azure";
+  // Qoder connects through a custom modal (so supportsManualConnect is false),
+  // but its API-key mode accepts Personal Access Tokens that bulk-import cleanly
+  // through the shared endpoint — surface the button for it too.
+  const supportsBulkUpload = (supportsManualConnect || isQoder) && providerSupportsApiKey && provider.id !== "azure";
   const enabledAccounts = myAccounts.filter((account) => !account.disabled).length;
   const activeModelCount = Math.max(0, modelList.length - disabledModelIds.size);
   const hasPrimaryConnect = hasCustomModal || !!oauthProvider || supportsManualConnect;
@@ -609,7 +612,7 @@ export function ProviderDetailPage() {
                 {supportsBulkUpload && (
                   <Button variant="ghost" onClick={() => setBulkOpen(true)}>
                     <Layers className="h-4 w-4" />
-                    Import keys
+                    {isQoder ? "Import tokens" : "Import keys"}
                   </Button>
                 )}
               </div>
@@ -1189,12 +1192,12 @@ function AccountRow({
 
   const boundPool = pools.find((p) => p.id === a.proxy_pool_id);
   const [detailsOpen, setDetailsOpen] = useState(false);
-  const supportsKiroQuota = a.provider === "kiro";
-  const hasExpandableDetails = supportsKiroQuota || a.provider === "codex";
+  const supportsQuota = a.provider === "kiro" || a.provider === "qoder";
+  const hasExpandableDetails = supportsQuota || a.provider === "codex";
   const accountQuota = useQuery({
     queryKey: ["account-quota", a.id],
     queryFn: () => api.accountQuota(a.id),
-    enabled: supportsKiroQuota && detailsOpen && !a.disabled,
+    enabled: supportsQuota && detailsOpen && !a.disabled,
     staleTime: 60_000,
     retry: 1,
   });
@@ -1344,8 +1347,8 @@ function AccountRow({
 
       {detailsOpen && (
         <div className="ml-6 mt-2">
-          {supportsKiroQuota && (
-            <KiroQuotaPanel
+          {supportsQuota && (
+            <AccountQuotaPanel
               loading={accountQuota.isLoading || accountQuota.isFetching}
               error={accountQuota.error instanceof Error ? accountQuota.error.message : ""}
               planName={accountQuota.data?.plan_name}
@@ -1362,7 +1365,7 @@ function AccountRow({
   );
 }
 
-function KiroQuotaPanel({
+function AccountQuotaPanel({
   loading,
   error,
   planName,
@@ -1387,7 +1390,7 @@ function KiroQuotaPanel({
             <Package className="h-4 w-4" />
           </div>
           <div className="min-w-0">
-            <p className="truncate text-sm font-semibold text-[var(--text)]">{planName || "Kiro package"}</p>
+            <p className="truncate text-sm font-semibold text-[var(--text)]">{planName || "Package"}</p>
             <p className="mt-0.5 text-xs text-[var(--text-muted)]">Live allowance from this account</p>
           </div>
         </div>
@@ -1396,7 +1399,7 @@ function KiroQuotaPanel({
           onClick={onRefresh}
           disabled={loading || disabled}
           className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-[var(--text-muted)] transition-[transform,background-color,color] duration-150 hover:bg-[var(--bg-elevated)] hover:text-[var(--text)] active:scale-[0.96] disabled:cursor-not-allowed disabled:opacity-40 disabled:active:scale-100"
-          aria-label="Refresh Kiro usage"
+          aria-label="Refresh usage"
           title="Refresh usage"
         >
           <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
@@ -1406,7 +1409,7 @@ function KiroQuotaPanel({
       {disabled ? (
         <p className="mt-3 text-xs text-[var(--text-muted)]">Enable this account to refresh its package usage.</p>
       ) : loading && quotas.length === 0 ? (
-        <div className="mt-4 space-y-3" aria-label="Loading Kiro usage">
+        <div className="mt-4 space-y-3" aria-label="Loading usage">
           {[0, 1].map((item) => (
             <div key={item} className="space-y-2">
               <div className="skeleton h-3 w-2/5 rounded" />
@@ -1426,7 +1429,7 @@ function KiroQuotaPanel({
           ))}
         </div>
       ) : (
-        <p className="mt-3 text-xs text-[var(--text-muted)]">{message || "Kiro did not report a usage allowance for this account."}</p>
+        <p className="mt-3 text-xs text-[var(--text-muted)]">{message || "No usage allowance reported for this account."}</p>
       )}
       {message && quotas.length > 0 && <p className="mt-3 text-xs text-[var(--text-muted)]">{message}</p>}
     </div>
@@ -1491,6 +1494,7 @@ function BulkAddKeysModal({ provider, onClose }: { provider: Provider; onClose: 
   const fileRef = useRef<HTMLInputElement>(null);
 
   const isCloudflare = provider.id === "cloudflare-ai";
+  const isQoder = provider.id === "qoder";
   const hasRegions = (provider.regions?.length ?? 0) > 0;
   // User-created custom provider instances already define a base URL, so keys
   // inherit it — no shared base URL input is needed here.
@@ -1501,8 +1505,10 @@ function BulkAddKeysModal({ provider, onClose }: { provider: Provider; onClose: 
   // Generic providers expose an optional shared base URL; region/Cloudflare
   // providers use their own dedicated control, and inherited-base-URL custom
   // instances need no input at all.
-  const showBaseURL = !hasRegions && !isCloudflare && !inheritsBaseURL;
-  const keyPlaceholder = provider.id === "xai" ? "xai-..." : "sk-...";
+  // Qoder PAT connections use Qoder's fixed endpoint, so hide the shared
+  // base-URL input for a clean paste-only flow.
+  const showBaseURL = !hasRegions && !isCloudflare && !inheritsBaseURL && !isQoder;
+  const keyPlaceholder = isQoder ? "pt-..." : provider.id === "xai" ? "xai-..." : "sk-...";
 
   const parsed = useMemo(() => parseKeys(text), [text]);
   const validCount = parsed.entries.length;
@@ -1561,8 +1567,8 @@ function BulkAddKeysModal({ provider, onClose }: { provider: Provider; onClose: 
     <Modal
       open
       onClose={onClose}
-      title={`Bulk add API keys — ${provider.display_name}`}
-      subtitle="Paste one key per line, or load a .txt/.csv file."
+      title={`${isQoder ? "Bulk add Personal Access Tokens" : "Bulk add API keys"} — ${provider.display_name}`}
+      subtitle={isQoder ? "Paste one pt-… token per line, or load a .txt/.csv file." : "Paste one key per line, or load a .txt/.csv file."}
       maxWidth="max-w-2xl"
     >
       {results ? (
@@ -1647,7 +1653,7 @@ function BulkAddKeysModal({ provider, onClose }: { provider: Provider; onClose: 
 
           <div className="space-y-1.5">
             <div className="flex items-center justify-between">
-              <label className="text-sm font-medium">API keys</label>
+              <label className="text-sm font-medium">{isQoder ? "Personal Access Tokens" : "API keys"}</label>
               <button
                 type="button"
                 onClick={() => fileRef.current?.click()}
@@ -1667,7 +1673,8 @@ function BulkAddKeysModal({ provider, onClose }: { provider: Provider; onClose: 
               className="w-full rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] px-3 py-2 font-mono text-xs placeholder:text-[var(--text-muted)] focus:border-accent-400 focus:outline-none"
             />
             <p className="text-[11px] leading-relaxed text-[var(--text-muted)]">
-              One key per line. Optional inline label: <code className="font-mono">label,key</code>. Blank lines and{" "}
+              One {isQoder ? "token" : "key"} per line. Optional inline label:{" "}
+              <code className="font-mono">label,{isQoder ? "token" : "key"}</code>. Blank lines and{" "}
               <code className="font-mono">#</code> comments are ignored.
             </p>
           </div>
@@ -2129,6 +2136,50 @@ function AuthCodeFlow({ provider, onClose }: { provider: OAuthProvider; onClose:
     };
     window.addEventListener("message", handler);
     return () => window.removeEventListener("message", handler);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [waiting, provider.provider]);
+
+  // Poll the gateway for server-side completion in parallel with the
+  // postMessage listener. postMessage alone is not enough: providers that set
+  // Cross-Origin-Opener-Policy on their auth pages (OpenAI/Codex) sever
+  // window.opener during the redirect, so the popup can never notify us and
+  // the user would be forced into pasting the callback URL manually.
+  useEffect(() => {
+    if (!waiting || !stateRef.current) return;
+    let stopped = false;
+    let timer = 0;
+    let expiredPolls = 0;
+    const tick = async () => {
+      try {
+        const res = await api.oauthCallbackStatus(provider.provider, stateRef.current);
+        if (stopped) return;
+        if (res.status === "success") {
+          finishSuccess();
+          return;
+        }
+        if (res.status === "error") {
+          setError(res.message || "Connection failed.");
+          setWaiting(false);
+          return;
+        }
+        // The session lives ~10 minutes; a few consecutive "expired" polls
+        // mean it is genuinely gone and the user should restart the flow.
+        if (res.status === "expired" && ++expiredPolls >= 3) {
+          setError("Sign-in session expired. Please try again.");
+          setWaiting(false);
+          return;
+        }
+        if (res.status === "pending") expiredPolls = 0;
+      } catch {
+        // Transient poll failures are ignored; the next tick retries.
+      }
+      if (!stopped) timer = window.setTimeout(tick, 2000);
+    };
+    timer = window.setTimeout(tick, 2000);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [waiting, provider.provider]);
 

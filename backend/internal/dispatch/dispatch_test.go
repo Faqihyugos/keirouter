@@ -281,6 +281,138 @@ func TestNoteFailureHonorsRateLimitRetryAfter(t *testing.T) {
 	require.WithinDuration(t, started.Add(4*time.Minute), *account.CooldownUntil, 2*time.Second)
 }
 
+func TestNoteFailureDedupsConcurrentFailures(t *testing.T) {
+	ctx := context.Background()
+	d, db := newDispatchTest(t, testAccount("acc-burst", 10))
+
+	// A burst of parallel requests failing on the same account must advance
+	// the backoff level once, not once per request.
+	for range 5 {
+		d.NoteFailure(ctx, "acc-burst", &core.ProviderError{Kind: core.ErrRateLimit})
+	}
+
+	account, err := db.Accounts().Get(ctx, "acc-burst")
+	require.NoError(t, err)
+	require.Equal(t, 1, account.BackoffLevel)
+	require.NotNil(t, account.CooldownUntil)
+}
+
+func TestNoteFailureDedupSuppressedStillReportsRetryAfter(t *testing.T) {
+	ctx := context.Background()
+	d, _ := newDispatchTest(t, testAccount("acc-hint", 10))
+
+	first := &core.ProviderError{Kind: core.ErrRateLimit, RetryAfter: 4 * time.Minute}
+	d.NoteFailure(ctx, "acc-hint", first)
+
+	// The suppressed failure reuses the cooldown set by the first one so the
+	// caller still surfaces an accurate retry hint.
+	second := &core.ProviderError{Kind: core.ErrRateLimit}
+	d.NoteFailure(ctx, "acc-hint", second)
+	require.Greater(t, second.RetryAfter, 3*time.Minute)
+}
+
+func TestNoteSuccessResetsFailureDedup(t *testing.T) {
+	ctx := context.Background()
+	d, db := newDispatchTest(t, testAccount("acc-recover", 10))
+
+	d.NoteFailure(ctx, "acc-recover", &core.ProviderError{Kind: core.ErrRateLimit})
+	d.NoteSuccess(ctx, "openai", "acc-recover", "gpt-4o")
+
+	// After a success the next failure is a fresh incident: it must apply a
+	// cooldown again instead of being swallowed by the dedup window.
+	d.NoteFailure(ctx, "acc-recover", &core.ProviderError{Kind: core.ErrRateLimit})
+
+	account, err := db.Accounts().Get(ctx, "acc-recover")
+	require.NoError(t, err)
+	require.Equal(t, 1, account.BackoffLevel)
+	require.NotNil(t, account.CooldownUntil)
+	require.True(t, account.CooldownUntil.After(time.Now()))
+}
+
+func TestNonCoolingErrorDoesNotConsumeDedupWindow(t *testing.T) {
+	ctx := context.Background()
+	d, db := newDispatchTest(t, testAccount("acc-mixed", 10))
+
+	// A client cancellation never cools down and must not suppress the real
+	// rate-limit failure that follows it.
+	d.NoteFailure(ctx, "acc-mixed", &core.ProviderError{Kind: core.ErrClientCanceled})
+	d.NoteFailure(ctx, "acc-mixed", &core.ProviderError{Kind: core.ErrRateLimit})
+
+	account, err := db.Accounts().Get(ctx, "acc-mixed")
+	require.NoError(t, err)
+	require.NotNil(t, account.CooldownUntil)
+}
+
+func TestNoteFailureCreditsExhaustedParksAccount(t *testing.T) {
+	ctx := context.Background()
+	d, db := newDispatchTest(t, testAccount("acc-dry", 10))
+
+	d.NoteFailure(ctx, "acc-dry", &core.ProviderError{
+		Kind:             core.ErrQuotaExhausted,
+		CreditsExhausted: true,
+	})
+
+	account, err := db.Accounts().Get(ctx, "acc-dry")
+	require.NoError(t, err)
+	require.True(t, account.CreditsExhausted, "a dry balance must flag the account")
+	require.NotNil(t, account.CooldownUntil)
+	require.WithinDuration(t, time.Now().Add(CreditsExhaustedCooldown), *account.CooldownUntil, time.Minute,
+		"a dry balance must park the account for the full credits cooldown")
+
+	// A later success (the user topped up) restores the account fully.
+	d.NoteSuccess(ctx, "openai", "acc-dry", "gpt-4o")
+	account, err = db.Accounts().Get(ctx, "acc-dry")
+	require.NoError(t, err)
+	require.False(t, account.CreditsExhausted)
+	require.Nil(t, account.CooldownUntil)
+}
+
+func TestNoteFailureCreditsExhaustedBypassesDedup(t *testing.T) {
+	ctx := context.Background()
+	d, db := newDispatchTest(t, testAccount("acc-dry-burst", 10))
+
+	// A rate-limit failure consumes the dedup window first; the terminal
+	// credits failure arriving inside the window must still park and flag
+	// the account instead of being collapsed into the short cooldown.
+	d.NoteFailure(ctx, "acc-dry-burst", &core.ProviderError{Kind: core.ErrRateLimit})
+	d.NoteFailure(ctx, "acc-dry-burst", &core.ProviderError{
+		Kind:             core.ErrQuotaExhausted,
+		CreditsExhausted: true,
+	})
+
+	account, err := db.Accounts().Get(ctx, "acc-dry-burst")
+	require.NoError(t, err)
+	require.True(t, account.CreditsExhausted, "the terminal credits flag must not be deduped away")
+	require.NotNil(t, account.CooldownUntil)
+	require.WithinDuration(t, time.Now().Add(CreditsExhaustedCooldown), *account.CooldownUntil, time.Minute,
+		"the 24h park must replace the short rate-limit cooldown")
+}
+
+func TestNoteFailurePlainQuotaDoesNotFlagCredits(t *testing.T) {
+	ctx := context.Background()
+	d, db := newDispatchTest(t, testAccount("acc-quota", 10))
+
+	// A calendar-window quota (daily/monthly) is not a dry balance: cooldown
+	// applies but the terminal credits flag must stay clear.
+	d.NoteFailure(ctx, "acc-quota", &core.ProviderError{Kind: core.ErrQuotaExhausted})
+
+	account, err := db.Accounts().Get(ctx, "acc-quota")
+	require.NoError(t, err)
+	require.False(t, account.CreditsExhausted)
+	require.NotNil(t, account.CooldownUntil)
+}
+
+func TestWithJitterStaysWithinBounds(t *testing.T) {
+	base := 100 * time.Second
+	limit := base + time.Duration(float64(base)*BackoffJitterFraction)
+	for range 100 {
+		got := withJitter(base)
+		require.GreaterOrEqual(t, got, base)
+		require.LessOrEqual(t, got, limit)
+	}
+	require.Equal(t, time.Duration(0), withJitter(0))
+}
+
 func TestPlanWith_AllowedAccountPinsCredential(t *testing.T) {
 	ctx := context.Background()
 	d, _ := newDispatchTest(t,
@@ -350,7 +482,10 @@ func TestPlanWith_AllCandidatesCoolingReturnsTypedRetry(t *testing.T) {
 	require.Equal(t, core.ErrRateLimit, pe.Kind)
 	require.Equal(t, core.FailureScopeAccount, pe.EffectiveScope())
 	require.Greater(t, pe.RetryAfter, time.Duration(0))
-	require.LessOrEqual(t, pe.RetryAfter, 2*time.Second)
+	// The upstream Retry-After is a lower bound; the local cooldown may extend
+	// it by up to BackoffJitterFraction.
+	maxRetry := time.Duration(float64(2*time.Second) * (1 + BackoffJitterFraction))
+	require.LessOrEqual(t, pe.RetryAfter, maxRetry)
 }
 
 func TestProviderCircuitOpensAndSuccessClosesIt(t *testing.T) {

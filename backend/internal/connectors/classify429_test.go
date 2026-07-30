@@ -111,7 +111,7 @@ func TestClassify429_QuotaExhausted(t *testing.T) {
 	resp.Header.Set("Content-Type", "application/json")
 
 	body := []byte(`{"error": {"message": "daily free allocation used up", "type": "quota_error"}}`)
-	kind, retryAfter := classify429(resp, body)
+	kind, retryAfter, _ := classify429(resp, body)
 
 	require.Equal(t, core.ErrQuotaExhausted, kind)
 	require.Equal(t, 30*time.Minute, retryAfter, "default quota cooldown should be 30m")
@@ -122,7 +122,7 @@ func TestClassify429_QuotaExhausted_WithRetryAfter(t *testing.T) {
 	resp.Header.Set("Retry-After", "3600")
 
 	body := []byte(`{"error": {"message": "monthly quota exceeded"}}`)
-	kind, retryAfter := classify429(resp, body)
+	kind, retryAfter, _ := classify429(resp, body)
 
 	require.Equal(t, core.ErrQuotaExhausted, kind)
 	require.Equal(t, time.Hour, retryAfter, "should use upstream Retry-After for quota")
@@ -132,7 +132,7 @@ func TestClassify429_RateLimit(t *testing.T) {
 	resp := &http.Response{Header: http.Header{}}
 
 	body := []byte(`{"error": {"message": "too many requests", "type": "rate_limit"}}`)
-	kind, retryAfter := classify429(resp, body)
+	kind, retryAfter, _ := classify429(resp, body)
 
 	require.Equal(t, core.ErrRateLimit, kind)
 	require.Equal(t, 5*time.Second, retryAfter, "default rate-limit backoff should be 5s")
@@ -143,7 +143,7 @@ func TestClassify429_RateLimit_WithRetryAfter(t *testing.T) {
 	resp.Header.Set("Retry-After", "10")
 
 	body := []byte(`{"error": {"message": "rate limit exceeded"}}`)
-	kind, retryAfter := classify429(resp, body)
+	kind, retryAfter, _ := classify429(resp, body)
 
 	require.Equal(t, core.ErrRateLimit, kind)
 	require.Equal(t, 10*time.Second, retryAfter)
@@ -156,7 +156,7 @@ func TestClassify429_XRateLimitReset(t *testing.T) {
 	resp.Header.Set("X-RateLimit-Reset", strconv.FormatInt(resetTime, 10))
 
 	body := []byte(`{"error": {"message": "rate limit"}}`)
-	kind, retryAfter := classify429(resp, body)
+	kind, retryAfter, _ := classify429(resp, body)
 
 	require.Equal(t, core.ErrRateLimit, kind)
 	require.True(t, retryAfter > 55*time.Second && retryAfter <= 60*time.Second,
@@ -204,4 +204,88 @@ func TestHTTPStatusError_429RateLimit_RetryAfter(t *testing.T) {
 
 	require.Equal(t, core.ErrRateLimit, pe.Kind)
 	require.Equal(t, 2*time.Minute, pe.RetryAfter)
+}
+
+func TestLooksLikeCreditsExhausted(t *testing.T) {
+	tests := []struct {
+		body string
+		want bool
+	}{
+		{"", false},
+		{"rate limit exceeded", false},
+		{"daily quota exceeded", false},
+		{"insufficient credits", true},
+		{"Insufficient balance", true},
+		{"insufficient funds for this request", true},
+		{"insufficient_quota", true},
+		{"You exceeded your current quota, please check your plan and billing details. insufficient_quota", true},
+		{"out of credits", true},
+		{"no credits remaining", true},
+		{"Your credit balance is too low to access the API.", true},
+		{"account balance depleted", true},
+		{"please purchase more credits", true},
+		{"top up your account to continue", true},
+		{"stop updating the dashboard", false},
+		{"Payment Required", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.body, func(t *testing.T) {
+			if got := looksLikeCreditsExhausted(tt.body); got != tt.want {
+				t.Errorf("looksLikeCreditsExhausted(%q) = %v, want %v", tt.body, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestClassify429_CreditsExhausted(t *testing.T) {
+	resp := &http.Response{Header: http.Header{}}
+	body := []byte(`{"error": {"message": "Insufficient credits. Please top up your account.", "type": "insufficient_quota"}}`)
+
+	kind, _, credits := classify429(resp, body)
+
+	require.Equal(t, core.ErrQuotaExhausted, kind)
+	require.True(t, credits, "a dry balance must be flagged as credits exhausted")
+}
+
+func TestHTTPStatusError_402SetsCreditsExhausted(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusPaymentRequired,
+		Header:     http.Header{},
+	}
+	body := []byte(`{"error": {"message": "Payment required"}}`)
+
+	pe := core.AsProviderError(httpStatusError("test", "model", resp, body))
+
+	require.Equal(t, core.ErrQuotaExhausted, pe.Kind)
+	require.True(t, pe.CreditsExhausted)
+	require.Equal(t, core.FailureScopeAccount, pe.EffectiveScope())
+}
+
+func TestHTTPStatusError_400CreditBalanceTooLow(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Header:     http.Header{},
+	}
+	body := []byte(`{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the API. Please go to Plans & Billing to upgrade or purchase credits."}}`)
+
+	pe := core.AsProviderError(httpStatusError("test", "model", resp, body))
+
+	require.Equal(t, core.ErrQuotaExhausted, pe.Kind,
+		"a 400 describing a dry balance must fall back, not surface as bad request")
+	require.True(t, pe.CreditsExhausted)
+	require.Equal(t, core.FailureScopeAccount, pe.EffectiveScope())
+}
+
+func TestHTTPStatusError_403InsufficientBalance(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusForbidden,
+		Header:     http.Header{},
+	}
+	body := []byte(`{"error": {"message": "Insufficient Balance", "type": "unknown_error"}}`)
+
+	pe := core.AsProviderError(httpStatusError("test", "model", resp, body))
+
+	require.Equal(t, core.ErrQuotaExhausted, pe.Kind)
+	require.True(t, pe.CreditsExhausted)
 }
