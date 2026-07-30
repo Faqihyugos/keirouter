@@ -397,6 +397,103 @@ func TestResponses_RenderRequest_WithTools(t *testing.T) {
 	require.Equal(t, "get_weather", parsed.Tools[0].Name)
 }
 
+func TestResponses_RenderRequest_EffortSuffixModel(t *testing.T) {
+	tests := []struct {
+		name          string
+		model         string
+		reasoning     *core.ReasoningConfig
+		wantModel     string
+		wantEffort    string
+		wantReasoning bool
+	}{
+		{
+			name:          "grok high suffix",
+			model:         "grok-4.5-high",
+			wantModel:     "grok-4.5",
+			wantEffort:    "high",
+			wantReasoning: true,
+		},
+		{
+			name:          "grok medium suffix",
+			model:         "grok-4.5-medium",
+			wantModel:     "grok-4.5",
+			wantEffort:    "medium",
+			wantReasoning: true,
+		},
+		{
+			name:          "grok low suffix",
+			model:         "grok-4.5-low",
+			wantModel:     "grok-4.5",
+			wantEffort:    "low",
+			wantReasoning: true,
+		},
+		{
+			name:          "base model no reasoning",
+			model:         "grok-4.5",
+			wantModel:     "grok-4.5",
+			wantReasoning: false,
+		},
+		{
+			name:          "explicit effort wins",
+			model:         "grok-4.5",
+			reasoning:     &core.ReasoningConfig{Effort: "high"},
+			wantModel:     "grok-4.5",
+			wantEffort:    "high",
+			wantReasoning: true,
+		},
+		{
+			name:          "explicit effort wins over suffix",
+			model:         "grok-4.5-low",
+			reasoning:     &core.ReasoningConfig{Effort: "high"},
+			wantModel:     "grok-4.5",
+			wantEffort:    "high",
+			wantReasoning: true,
+		},
+		{
+			name:          "codex high suffix",
+			model:         "gpt-5.3-codex-high",
+			wantModel:     "gpt-5.3-codex",
+			wantEffort:    "high",
+			wantReasoning: true,
+		},
+		{
+			name:          "none suffix strips without reasoning",
+			model:         "grok-4.5-none",
+			wantModel:     "grok-4.5",
+			wantReasoning: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := &core.ChatRequest{
+				Model:     tc.model,
+				Reasoning: tc.reasoning,
+				Messages: []core.Message{
+					{Role: core.RoleUser, Content: []core.ContentPart{{Type: core.PartText, Text: "hi"}}},
+				},
+			}
+			body, err := OpenAIResponsesCodec{}.RenderRequest(req)
+			require.NoError(t, err)
+
+			var parsed struct {
+				Model     string `json:"model"`
+				Reasoning *struct {
+					Effort string `json:"effort"`
+				} `json:"reasoning"`
+			}
+			require.NoError(t, json.Unmarshal(body, &parsed))
+			require.Equal(t, tc.wantModel, parsed.Model)
+			if tc.wantReasoning {
+				require.NotNil(t, parsed.Reasoning)
+				require.Equal(t, tc.wantEffort, parsed.Reasoning.Effort)
+			} else {
+				require.Nil(t, parsed.Reasoning)
+			}
+		})
+	}
+}
+
 func toStrings(b [][]byte) []string {
 	out := make([]string, len(b))
 	for i, x := range b {

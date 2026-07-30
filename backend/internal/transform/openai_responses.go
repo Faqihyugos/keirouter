@@ -332,8 +332,17 @@ func rawToString(raw json.RawMessage) string {
 // ---- request rendering (outbound to Codex/Responses provider) ---------------
 
 func (c OpenAIResponsesCodec) RenderRequest(req *core.ChatRequest) ([]byte, error) {
+	// Catalog aliases like grok-4.5-high / gpt-5.3-codex-high are not real
+	// upstream model IDs. Strip the effort suffix and emit reasoning.effort
+	// instead. Explicit req.Reasoning.Effort wins over the suffix value.
+	model, suffixEffort := splitResponsesEffortModel(req.Model)
+	effort := suffixEffort
+	if req.Reasoning != nil && strings.TrimSpace(req.Reasoning.Effort) != "" {
+		effort = strings.TrimSpace(req.Reasoning.Effort)
+	}
+
 	out := map[string]any{
-		"model":  req.Model,
+		"model":  model,
 		"stream": req.Stream,
 		"store":  false,
 	}
@@ -347,27 +356,29 @@ func (c OpenAIResponsesCodec) RenderRequest(req *core.ChatRequest) ([]byte, erro
 	default:
 		out["instructions"] = ""
 	}
-	// Reasoning effort where the client (or the codex connector) requested it.
-	// "Model decides" values (auto/adaptive — e.g. Claude Code's adaptive
-	// thinking) have no Responses API wire value and cause 400
-	// invalid_value upstream, so they are omitted rather than forwarded.
-	// The codex connector normalizes efforts before rendering, so this guard
-	// only fires for non-codex Responses providers.
-	if req.Reasoning != nil && req.Reasoning.Effort != "" {
-		effort := strings.ToLower(req.Reasoning.Effort)
-		if effort == "auto" || effort == "adaptive" || effort == "default" {
-			effort = ""
+	// Reasoning effort where the client, the catalog suffix, or the codex
+	// connector requested it. "Model decides" values (auto/adaptive — e.g.
+	// Claude Code's adaptive thinking) have no Responses API wire value and
+	// cause 400 invalid_value upstream, so they are omitted rather than
+	// forwarded. The codex connector normalizes efforts before rendering, so
+	// that guard only fires for non-codex Responses providers.
+	effort = strings.ToLower(effort)
+	if effort == "auto" || effort == "adaptive" || effort == "default" {
+		effort = ""
+	}
+	switch {
+	case c.Codex && effort != "":
+		// Codex accepts "none" as a wire value; the other efforts also stream
+		// reasoning summaries and need the encrypted reasoning content echoed
+		// back on follow-up turns (store=false).
+		reasoning := map[string]any{"effort": effort}
+		if effort != "none" {
+			reasoning["summary"] = "auto"
+			out["include"] = []string{"reasoning.encrypted_content"}
 		}
-		if effort != "" {
-			reasoning := map[string]any{"effort": effort}
-			if c.Codex && effort != "none" {
-				// Codex streams reasoning summaries and needs the encrypted
-				// reasoning content echoed back on follow-up turns (store=false).
-				reasoning["summary"] = "auto"
-				out["include"] = []string{"reasoning.encrypted_content"}
-			}
-			out["reasoning"] = reasoning
-		}
+		out["reasoning"] = reasoning
+	case isResponsesReasoningEffortEnabled(effort):
+		out["reasoning"] = map[string]any{"effort": effort}
 	}
 	// NOTE: temperature, max_tokens, top_p are intentionally NOT included.
 	// These are Chat Completions parameters that the Responses API does not
@@ -495,6 +506,27 @@ func (c OpenAIResponsesCodec) RenderRequest(req *core.ChatRequest) ([]byte, erro
 	}
 
 	return json.Marshal(out)
+}
+
+// splitResponsesEffortModel peels a trailing effort suffix off a synthetic
+// catalog model id (e.g. "grok-4.5-high" → "grok-4.5", "high"). Longest
+// suffixes are checked first so "-xhigh" wins over "-high".
+func splitResponsesEffortModel(model string) (base, effort string) {
+	for _, suf := range []string{"-xhigh", "-high", "-medium", "-low", "-none"} {
+		if strings.HasSuffix(model, suf) && len(model) > len(suf) {
+			return strings.TrimSuffix(model, suf), strings.TrimPrefix(suf, "-")
+		}
+	}
+	return model, ""
+}
+
+func isResponsesReasoningEffortEnabled(effort string) bool {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "", "none", "off", "disable", "disabled":
+		return false
+	default:
+		return true
+	}
 }
 
 // ---- unary response parsing (from Codex/Responses provider) -----------------

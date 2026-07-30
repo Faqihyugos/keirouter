@@ -25,6 +25,17 @@ type OpenAIResponses struct {
 	codec       transform.OpenAIResponsesCodec
 }
 
+// Identity headers required by cli-chat-proxy.grok.com for the grok-cli
+// provider. Without x-grok-client-version the proxy returns HTTP 426 with
+// "Your Grok CLI version (none) is outdated".
+const (
+	grokCLIVersion          = "0.2.93"
+	grokCLIClientIdentifier = "grok-shell"
+	grokCLITokenAuth        = "xai-grok-cli"
+	grokCLIAuthenticateResp = "authenticate-response"
+	grokCLIClientMode       = "headless"
+)
+
 // NewOpenAIResponses builds a Responses connector.
 func NewOpenAIResponses(id, defaultBaseURL string) *OpenAIResponses {
 	return &OpenAIResponses{
@@ -99,6 +110,14 @@ func (c *OpenAIResponses) headers(creds core.Credentials) map[string]string {
 	// ...) on inference calls; a bare Authorization header is not enough.
 	if c.id == "codex" {
 		applyCodexHeaders(h, creds)
+	}
+	if c.id == "grok-cli" {
+		h["x-grok-client-version"] = grokCLIVersion
+		h["x-grok-client-identifier"] = grokCLIClientIdentifier
+		h["X-XAI-Token-Auth"] = grokCLITokenAuth
+		h["x-authenticateresponse"] = grokCLIAuthenticateResp
+		h["x-grok-client-mode"] = grokCLIClientMode
+		h["User-Agent"] = fmt.Sprintf("grok-shell/%s (linux; x86_64)", grokCLIVersion)
 	}
 	return mergeHeaders(h, creds.Headers)
 }
@@ -215,7 +234,7 @@ func (c *OpenAIResponses) Stream(ctx context.Context, req *core.ChatRequest, cre
 		// so Codex clients don't hang waiting for a terminal event.
 		if !terminalSeen {
 			out <- core.StreamChunk{
-				Type: core.ChunkText,
+				Type:  core.ChunkText,
 				Delta: formatResponsesFailureAndDone(),
 			}
 		}
