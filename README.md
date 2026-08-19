@@ -118,6 +118,7 @@ brew install keirouter
 
 keirouter -bootstrap   # mint your first API key (printed once — don't blink)
 keirouter start        # fire up the server on :20180
+keirouter tray         # or run in background with system tray icon
 ```
 </details>
 
@@ -170,6 +171,7 @@ It downloads the latest prebuilt binary, drops it (plus the dashboard) into `%LO
 ```powershell
 keirouter -bootstrap   # mint your first API key (printed once)
 keirouter start        # start the server on :20180
+keirouter tray         # or run in background with system tray icon
 ```
 
 > Pin a version or change the location with `$env:KEIROUTER_VERSION` / `$env:KEIROUTER_DIR` before running the one-liner.
