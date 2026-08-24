@@ -328,6 +328,7 @@ func serveWithTray(cfg config.Config, log *slog.Logger, isPretty, autoOpenBrowse
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 
 	if autoOpenBrowser {
 		go openDashboardWhenReady(ctx, cfg)
@@ -337,14 +338,6 @@ func serveWithTray(cfg config.Config, log *slog.Logger, isPretty, autoOpenBrowse
 	if err != nil {
 		return fmt.Errorf("build app: %w", err)
 	}
-
-	serverErrCh := make(chan error, 1)
-	go func() {
-		if err := application.Run(ctx); err != nil {
-			serverErrCh <- err
-		}
-		close(serverErrCh)
-	}()
 
 	dashURL := dashboardURL(cfg)
 	t := tray.New(tray.Options{
@@ -363,24 +356,39 @@ func serveWithTray(cfg config.Config, log *slog.Logger, isPretty, autoOpenBrowse
 		case sig := <-sigCh:
 			log.Info("received termination signal", "signal", sig)
 			cancel()
-			t.Stop()
 		case <-ctx.Done():
-			t.Stop()
 		}
 	}()
 
-	// Run system tray on main OS thread
+	return runTrayLifecycle(ctx, cancel, application.Run, t)
+}
+
+type trayLifecycle interface {
+	Run(context.Context) error
+	Stop()
+}
+
+// runTrayLifecycle keeps the HTTP server and tray event loop in the same
+// lifecycle. The tray must run on the calling OS thread, while the server runs
+// in the background. Whichever side exits first cancels and stops the other.
+func runTrayLifecycle(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	runServer func(context.Context) error,
+	t trayLifecycle,
+) error {
+	serverErrCh := make(chan error, 1)
+	go func() {
+		serverErrCh <- runServer(ctx)
+		cancel()
+		t.Stop()
+	}()
+
+	// Keep the native tray message loop on the main OS thread.
 	trayErr := t.Run(ctx)
-
-	// Ensure background context is cancelled when tray exits
 	cancel()
-
-	var serverErr error
-	for err := range serverErrCh {
-		if err != nil {
-			serverErr = err
-		}
-	}
+	t.Stop()
+	serverErr := <-serverErrCh
 
 	if trayErr != nil {
 		return fmt.Errorf("system tray: %w", trayErr)
