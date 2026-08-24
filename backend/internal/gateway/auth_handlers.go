@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -46,7 +47,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to create session")
 		return
 	}
-	s.setSessionCookie(w, token)
+	s.setSessionCookie(w, r, token)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":                  true,
 		"using_default":       s.auth.UsingDefaultPassword(r.Context()),
@@ -54,14 +55,14 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleLogout(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
 		Value:    "",
 		Path:     "/",
 		MaxAge:   -1,
 		HttpOnly: true,
-		Secure:   true,
+		Secure:   s.sessionCookieSecure(r),
 		SameSite: http.SameSiteLaxMode,
 	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
@@ -102,16 +103,55 @@ func (s *Server) handleCompleteOnboarding(w http.ResponseWriter, r *http.Request
 }
 
 // setSessionCookie writes the session cookie with the configured lifetime.
-func (s *Server) setSessionCookie(w http.ResponseWriter, token string) {
+func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, token string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
 		Value:    token,
 		Path:     "/",
 		Expires:  time.Now().Add(s.auth.TTL()),
 		HttpOnly: true,
-		Secure:   true,
+		Secure:   s.sessionCookieSecure(r),
 		SameSite: http.SameSiteLaxMode,
 	})
+}
+
+// sessionCookieSecure decides whether the dashboard session cookie carries the
+// Secure attribute. Browsers reject Secure cookies on insecure origins (plain
+// HTTP, non-localhost), which silently broke login on fresh installs reached
+// over http://<host> — the login API returned ok but the browser refused to
+// store the cookie, leaving the user stuck on the login page (issue #56).
+//
+// The flag is set only when the connection is encrypted end to end from the
+// browser's point of view: a direct TLS connection, or a request whose reverse
+// proxy asserts proto=https via X-Forwarded-Proto / RFC 7239 Forwarded while
+// security.trust_forwarded_headers is enabled. Everything else — including
+// plain-HTTP local and LAN deployments — gets Secure=false so the cookie is
+// accepted over HTTP.
+func (s *Server) sessionCookieSecure(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	if !s.cfg.Security.TrustForwardedHeaders {
+		return false
+	}
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		// Proxies may send a comma-separated chain; the first hop is the
+		// client-facing one.
+		first, _, _ := strings.Cut(proto, ",")
+		return strings.EqualFold(strings.TrimSpace(first), "https")
+	}
+	if fwd := r.Header.Get("Forwarded"); fwd != "" {
+		// RFC 7239: Forwarded: for=192.0.2.60;proto=https;by=203.0.113.43
+		for _, elem := range strings.Split(fwd, ",") {
+			for _, param := range strings.Split(elem, ";") {
+				k, v, ok := strings.Cut(strings.TrimSpace(param), "=")
+				if ok && strings.EqualFold(strings.TrimSpace(k), "proto") {
+					return strings.EqualFold(strings.Trim(strings.TrimSpace(v), `"`), "https")
+				}
+			}
+		}
+	}
+	return false
 }
 
 // sessionMiddleware protects the admin API: it requires a valid session cookie.

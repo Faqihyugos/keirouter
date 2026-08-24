@@ -47,6 +47,16 @@ security:
   # such as vLLM, Ollama, or LM Studio. Cloud metadata and link-local addresses
   # remain blocked.
   allow_private_base_url: false
+  # Trust X-Forwarded-Proto / RFC 7239 Forwarded headers when deciding whether
+  # the dashboard session cookie gets the Secure attribute. With the default
+  # (true), a TLS-terminating reverse proxy (nginx/Caddy/Traefik), Tailscale
+  # Funnel, or Cloudflare Tunnel that asserts proto=https causes the cookie to
+  # be marked Secure, so it is only ever sent over HTTPS. Trusting these
+  # headers is safe here: they can only ever enable the Secure attribute.
+  # When disabled, the cookie is Secure only on direct TLS connections —
+  # plain-HTTP dashboards (e.g. a fresh install on http://<vps-ip>:20180) get a
+  # non-Secure cookie so browsers accept it (issue #56).
+  trust_forwarded_headers: true
 
 meter:
   # Buffered/batched usage writes. Keeps request latency low and reduces DB

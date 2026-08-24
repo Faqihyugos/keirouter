@@ -88,6 +88,19 @@ type SecurityConfig struct {
 	// non-http(s) schemes remain blocked. Intended for self-hosted/LAN setups
 	// pointing at on-network LLM endpoints. Default false.
 	AllowPrivateBaseURL bool `koanf:"allow_private_base_url"`
+	// TrustForwardedHeaders lets the dashboard session-cookie Secure attribute be
+	// driven by X-Forwarded-Proto / RFC 7239 Forwarded headers, which is how a
+	// TLS-terminating reverse proxy (nginx/Caddy/Traefik), Tailscale Funnel, or
+	// Cloudflare Tunnel signals that the client connection is HTTPS.
+	//
+	// Trusting these headers is safe here: they can only ever *enable* the Secure
+	// attribute (asserted proto=https). A spoofed header cannot weaken security,
+	// because Secure=true is the more restrictive state. Default true so HTTPS
+	// deployments behind a proxy keep a Secure cookie with zero extra config.
+	//
+	// Set false to ignore forwarded headers entirely and base the flag only on a
+	// direct TLS connection. Default true.
+	TrustForwardedHeaders bool `koanf:"trust_forwarded_headers"`
 }
 
 // CacheConfig configures the semantic response cache.
@@ -277,8 +290,9 @@ func Default() Config {
 			ConnMaxIdleTime: 5 * time.Minute,
 		},
 		Security: SecurityConfig{
-			SessionTTL:       24 * time.Hour,
-			BindLoopbackOnly: true,
+			SessionTTL:            24 * time.Hour,
+			BindLoopbackOnly:      true,
+			TrustForwardedHeaders: true, // default true: safe to trust proxies for Secure flag; only ever strengthens security
 		},
 		Cache: CacheConfig{
 			Enabled:             false,

@@ -180,7 +180,9 @@ keirouter start        # start the server on :20180
 | How you installed | Open this | Password |
 |---|---|---|
 | From source (quickstart / `make setup`) | http://localhost:5180 | `keirouter` |
-| Homebrew / Docker / production | http://localhost:20180 | `keirouter` |
+| Homebrew / Docker / production | http://localhost:20180 or `http://YOUR_VPS_IP:20180` | `keirouter` |
+
+> **Remote dashboard access:** Plain HTTP works for initial LAN/VPS access, but HTTPS is strongly recommended for production. Behind a TLS-terminating reverse proxy, make sure it overwrites client-supplied `X-Forwarded-Proto` and `Forwarded` headers so KeiRouter can apply the `Secure` session-cookie flag correctly. See the [deployment guide](deploy/README.md) for configuration details.
 
 It'll nudge you to change that password the second you log in (please do 🙏). Allergic to UIs? Mint a key straight from the terminal:
 
