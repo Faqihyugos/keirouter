@@ -49,10 +49,7 @@ func (t *Tray) Run(ctx context.Context) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	initPlatform()
-
 	st := systray.New()
-	t.tray = st
 
 	// Configure Icon
 	if len(DefaultIcon) > 0 {
@@ -116,10 +113,23 @@ func (t *Tray) Run(ctx context.Context) error {
 	// Best-effort startup notification
 	st.ShowNotification("KeiRouter", fmt.Sprintf("Running in background on %s", t.opts.DashboardURL))
 
+	// Publish the native tray only after setup is complete. Stop may have won
+	// the race while setup was in progress; in that case tear this instance down
+	// immediately instead of entering an event loop that can no longer be stopped.
+	if !t.attach(st) {
+		st.Remove()
+		return nil
+	}
+
 	// Listen for ctx cancellation in background to tear down tray loop
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		<-ctx.Done()
-		t.Stop()
+		select {
+		case <-ctx.Done():
+			t.Stop()
+		case <-done:
+		}
 	}()
 
 	t.opts.Logger.Info("system tray initialized", "url", t.opts.DashboardURL)
@@ -132,15 +142,33 @@ func (t *Tray) Run(ctx context.Context) error {
 	return nil
 }
 
-// Stop removes the tray icon and exits the event loop safely.
-func (t *Tray) Stop() {
+// attach publishes a fully initialized native tray unless Stop already won the
+// startup race. It is kept separate so the state transition can be unit tested
+// without starting a platform event loop.
+func (t *Tray) attach(st *systray.SystemTray) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.stopped {
+		return false
+	}
+	t.tray = st
+	return true
+}
+
+// Stop removes the tray icon and exits the event loop safely.
+func (t *Tray) Stop() {
+	t.mu.Lock()
+	if t.stopped {
+		t.mu.Unlock()
 		return
 	}
 	t.stopped = true
-	if t.tray != nil {
-		t.tray.Remove()
+	st := t.tray
+	t.mu.Unlock()
+
+	// Do not hold the state mutex while calling platform code. Remove is
+	// idempotently guarded above and may dispatch work to the UI thread.
+	if st != nil {
+		st.Remove()
 	}
 }

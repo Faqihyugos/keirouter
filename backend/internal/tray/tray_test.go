@@ -45,3 +45,28 @@ func TestTrayStopIdempotent(t *testing.T) {
 		tray.Stop()
 	})
 }
+
+func TestTrayCannotAttachAfterEarlyStop(t *testing.T) {
+	tray := New(Options{})
+	tray.Stop()
+
+	assert.False(t, tray.attach(nil), "a tray stopped during startup must not enter its event loop")
+}
+
+func TestTrayAttachAndStopAreRaceSafe(t *testing.T) {
+	for range 100 {
+		tray := New(Options{})
+		started := make(chan struct{})
+		done := make(chan struct{})
+
+		go func() {
+			close(started)
+			tray.attach(nil)
+			close(done)
+		}()
+
+		<-started
+		tray.Stop()
+		<-done
+	}
+}
