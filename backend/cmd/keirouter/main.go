@@ -36,6 +36,7 @@ import (
 	"github.com/mydisha/keirouter/backend/internal/app"
 	"github.com/mydisha/keirouter/backend/internal/config"
 	"github.com/mydisha/keirouter/backend/internal/prettylog"
+	"github.com/mydisha/keirouter/backend/internal/tray"
 	"github.com/mydisha/keirouter/backend/internal/version"
 )
 
@@ -44,6 +45,10 @@ import (
 // Docker/PaaS build with no git), version.Resolve falls back to the committed
 // VERSION file so the dashboard still reports a real version.
 var Version = "dev"
+
+func init() {
+	runtime.LockOSThread()
+}
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -75,6 +80,8 @@ func run(args []string) error {
 		switch cmd {
 		case "start":
 			return cmdStart(rest)
+		case "tray":
+			return cmdTray(rest)
 		case "status":
 			return cmdStatus(rest)
 		case "bootstrap":
@@ -100,6 +107,7 @@ Usage:
 
 Commands:
   start        Start the server (default when no command is given)
+  tray         Start the server in background with a system tray icon
   status       Check whether a local server is running and print its URL
   bootstrap    Create an initial API key and print it once
   version      Print version and exit
@@ -107,11 +115,14 @@ Commands:
 
 Common flags:
   -config <path>     Path to a YAML config file (optional)
-  --no-browser       (start) Do not open the dashboard in a browser
+  --tray             (start) Run with system tray icon in menu bar / taskbar
+  --no-browser       (start, tray) Do not open the dashboard in a browser
   -key-name <name>   (bootstrap) Name for the created API key
 
 Examples:
   keirouter start                 # start the server, open the dashboard
+  keirouter start --tray          # start in background with system tray icon
+  keirouter tray                  # shorthand for start --tray
   keirouter start --no-browser    # start without opening a browser
   keirouter bootstrap             # mint your first API key
   keirouter status                # is it running?
@@ -123,6 +134,7 @@ func cmdStart(args []string) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	configPath := fs.String("config", "", "path to a YAML config file (optional)")
 	noBrowser := fs.Bool("no-browser", false, "do not open the dashboard in a browser")
+	useTray := fs.Bool("tray", false, "run with system tray icon in menu bar / taskbar")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -134,7 +146,27 @@ func cmdStart(args []string) error {
 	// Open the dashboard by default, but only on an interactive terminal so
 	// headless/Docker runs stay quiet. --no-browser always wins.
 	openBrowser := isPretty && !*noBrowser
+	if *useTray {
+		return serveWithTray(cfg, log, isPretty, openBrowser)
+	}
 	return serve(cfg, log, isPretty, openBrowser)
+}
+
+// cmdTray starts the server with system tray enabled.
+func cmdTray(args []string) error {
+	fs := flag.NewFlagSet("tray", flag.ContinueOnError)
+	configPath := fs.String("config", "", "path to a YAML config file (optional)")
+	noBrowser := fs.Bool("no-browser", false, "do not open the dashboard in a browser")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, log, isPretty, err := setup(*configPath)
+	if err != nil {
+		return err
+	}
+	openBrowser := isPretty && !*noBrowser
+	return serveWithTray(cfg, log, isPretty, openBrowser)
 }
 
 // cmdBootstrap creates an initial API key and exits.
@@ -184,6 +216,8 @@ func runLegacy(args []string) error {
 	bootstrap := fs.Bool("bootstrap", false, "create an initial API key and exit")
 	healthcheck := fs.Bool("healthcheck", false, "check the local HTTP health endpoint and exit")
 	keyName := fs.String("key-name", "default", "name for the bootstrapped API key")
+	useTray := fs.Bool("tray", false, "run with system tray icon in menu bar / taskbar")
+	noBrowser := fs.Bool("no-browser", false, "do not open the dashboard in a browser")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -204,6 +238,10 @@ func runLegacy(args []string) error {
 	if *bootstrap {
 		return doBootstrap(cfg, *keyName)
 	}
+	openBrowser := isPretty && !*noBrowser
+	if *useTray {
+		return serveWithTray(cfg, log, isPretty, openBrowser)
+	}
 	// Legacy plain `keirouter` keeps the original behavior: serve without
 	// auto-opening a browser.
 	return serve(cfg, log, isPretty, false)
@@ -220,9 +258,9 @@ func setup(configPath string) (config.Config, *slog.Logger, bool, error) {
 	return cfg, log, isPretty, nil
 }
 
-// serve builds the application and runs it until interrupted. When openBrowser
+// serve builds the application and runs it until interrupted. When autoOpenBrowser
 // is true it launches the dashboard once the server reports healthy.
-func serve(cfg config.Config, log *slog.Logger, isPretty, openBrowser bool) error {
+func serve(cfg config.Config, log *slog.Logger, isPretty, autoOpenBrowser bool) error {
 	resolvedVersion := version.Resolve(Version)
 
 	// Print the startup banner in pretty mode (TTY only).
@@ -249,7 +287,7 @@ func serve(cfg config.Config, log *slog.Logger, isPretty, openBrowser bool) erro
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if openBrowser {
+	if autoOpenBrowser {
 		go openDashboardWhenReady(ctx, cfg)
 	}
 
@@ -259,6 +297,95 @@ func serve(cfg config.Config, log *slog.Logger, isPretty, openBrowser bool) erro
 	}
 
 	return application.Run(ctx)
+}
+
+// serveWithTray builds the application and runs it while pumping the system
+// tray message loop on the main OS thread.
+func serveWithTray(cfg config.Config, log *slog.Logger, isPretty, autoOpenBrowser bool) error {
+	resolvedVersion := version.Resolve(Version)
+
+	if isPretty {
+		cacheLabel := "disabled"
+		if cfg.Cache.Enabled {
+			cacheLabel = cfg.Cache.Backend
+		}
+		dataDir := cfg.Data.Dir
+		if dataDir == "" {
+			dataDir = "~/.keirouter"
+		}
+		prettylog.PrintBannerStdout(prettylog.BannerConfig{
+			Version:  resolvedVersion,
+			Addr:     cfg.Addr(),
+			DBDriver: cfg.Database.Driver,
+			Cache:    cacheLabel,
+			DataDir:  dataDir,
+			LogLevel: cfg.Log.Level + " (pretty)",
+		})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	if autoOpenBrowser {
+		go openDashboardWhenReady(ctx, cfg)
+	}
+
+	application, err := app.Build(ctx, cfg, log, resolvedVersion)
+	if err != nil {
+		return fmt.Errorf("build app: %w", err)
+	}
+
+	serverErrCh := make(chan error, 1)
+	go func() {
+		if err := application.Run(ctx); err != nil {
+			serverErrCh <- err
+		}
+		close(serverErrCh)
+	}()
+
+	dashURL := dashboardURL(cfg)
+	t := tray.New(tray.Options{
+		Version:      resolvedVersion,
+		DashboardURL: dashURL,
+		Port:         cfg.Server.Port,
+		OnOpenURL:    openBrowser,
+		OnQuit: func() {
+			cancel()
+		},
+		Logger: log,
+	})
+
+	go func() {
+		select {
+		case sig := <-sigCh:
+			log.Info("received termination signal", "signal", sig)
+			cancel()
+			t.Stop()
+		case <-ctx.Done():
+			t.Stop()
+		}
+	}()
+
+	// Run system tray on main OS thread
+	trayErr := t.Run(ctx)
+
+	// Ensure background context is cancelled when tray exits
+	cancel()
+
+	var serverErr error
+	for err := range serverErrCh {
+		if err != nil {
+			serverErr = err
+		}
+	}
+
+	if trayErr != nil {
+		return fmt.Errorf("system tray: %w", trayErr)
+	}
+	return serverErr
 }
 
 // doBootstrap creates an initial API key and prints it once.
