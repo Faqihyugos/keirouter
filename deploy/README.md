@@ -97,7 +97,9 @@ docker compose logs -f keirouter
 ```
 
 **5. Access the Dashboard**
-By default, KeiRouter will be available at `http://YOUR_VPS_IP:20180`. It is highly recommended to put KeiRouter behind a reverse proxy like **Nginx**, **Caddy**, or **Traefik** to secure it with HTTPS and a custom domain.
+By default, KeiRouter will be available at `http://YOUR_VPS_IP:20180`. KeiRouter automatically trusts `X-Forwarded-Proto` from TLS-terminating reverse proxies by default, so cookies will be marked Secure only when you actually serve HTTPS through nginx/Caddy/Traefik. The dashboard session cookie remains usable over plain HTTP for local-only deployments (see issue #56).
+
+It is highly recommended to put KeiRouter behind a reverse proxy like **Nginx**, **Caddy**, or **Traefik** to secure it with HTTPS and a custom domain.
 
 ### Option 2: VPS with Postgres
 
@@ -136,6 +138,9 @@ Deploying KeiRouter on [Coolify](https://coolify.io/) is highly recommended as i
    KEIROUTER_SERVER__HOST=0.0.0.0
    KEIROUTER_SERVER__PORT=20180
    KEIROUTER_SECURITY__BIND_LOOPBACK_ONLY=false
+   # Coolify terminates TLS and forwards via X-Forwarded-Proto; trusting it
+   # (the default) makes the dashboard session cookie Secure over HTTPS.
+   KEIROUTER_SECURITY__TRUST_FORWARDED_HEADERS=true
    # Generate a 32-byte base64 key locally and paste it here:
    KEIROUTER_SECURITY__MASTER_KEY=<your_generated_master_key>
    KEIROUTER_LOG__FORMAT=json
